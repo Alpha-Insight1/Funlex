@@ -1771,13 +1771,19 @@ if not is_admin and page not in ("Record Sale", "View Stock"):
 # ─────────────────────────────────────────────
 if page == "Dashboard":
     st.header("Company Dashboard")
-    st.caption("Revenue, expenses and profit by branch. Profit = revenue − recorded expenses − salaries paid (COGS for finished goods not fully deducted).")
+    st.caption(
+        "Profit = revenue − expenses − salaries paid. "
+        "Finished-goods cost of goods is not fully deducted unless tracked separately."
+    )
 
-    # Period filter
-    p1, p2, p3 = st.columns([1, 1, 1])
-    with p1:
-        period = st.selectbox("Period", ["Today", "This month", "Last 30 days", "All time"], key="dash_period")
     today = date.today()
+    p1, p2 = st.columns([1, 2])
+    with p1:
+        period = st.selectbox(
+            "Period",
+            ["Today", "This month", "Last 30 days", "All time"],
+            key="dash_period",
+        )
     if period == "Today":
         d0 = d1 = today.isoformat()
     elif period == "This month":
@@ -1797,11 +1803,47 @@ if page == "Dashboard":
     low_stock = products[products["current_stock"] <= 5] if not products.empty else pd.DataFrame()
     try:
         raws = get_raw_materials_df()
-        low_raw = len(raws[raws["current_qty"] <= raws["reorder_level"]]) if not raws.empty else 0
+        low_raw_df = raws[raws["current_qty"] <= raws["reorder_level"]] if not raws.empty else pd.DataFrame()
+        low_raw = len(low_raw_df)
         inv_val = float((raws["current_qty"] * raws["unit_cost"]).sum()) if not raws.empty else 0.0
     except Exception:
+        low_raw_df = pd.DataFrame()
         low_raw, inv_val = 0, 0.0
 
+    # ── At a glance (top) ──
+    st.subheader("At a glance")
+    g1, g2, g3, g4, g5 = st.columns(5)
+    today_str = today.isoformat()
+    today_sales = sales[sales["sale_date"] == today_str] if not sales.empty else pd.DataFrame()
+    g1.metric(
+        "Today's sales (Main)",
+        f"₦{today_sales['amount'].sum():,.0f}" if not today_sales.empty else "₦0",
+    )
+    g2.metric("Active staff", len(staff))
+    g3.metric(
+        "Monthly payroll (active)",
+        f"₦{staff['monthly_salary'].sum():,.0f}" if not staff.empty else "₦0",
+    )
+    g4.metric("Low product stock", len(low_stock))
+    g5.metric("Raw materials value", f"₦{inv_val:,.0f}")
+
+    # Alerts (no tables)
+    if low_raw:
+        names = ", ".join(low_raw_df["name"].astype(str).head(8).tolist())
+        more = f" (+{low_raw - 8} more)" if low_raw > 8 else ""
+        st.warning(
+            f"**{low_raw} raw material(s) need reorder:** {names}{more} — open **Raw Materials**."
+        )
+    if not low_stock.empty:
+        names = ", ".join(low_stock["name"].astype(str).head(8).tolist())
+        more = f" (+{len(low_stock) - 8} more)" if len(low_stock) > 8 else ""
+        st.warning(
+            f"**{len(low_stock)} finished product(s) low/out of stock:** {names}{more} — open **View Stock**."
+        )
+
+    st.divider()
+
+    # ── Branch performance ──
     st.subheader("Branch performance")
     b1, b2, b3 = st.columns(3)
     with b1:
@@ -1821,49 +1863,9 @@ if page == "Dashboard":
         st.metric("Net profit (approx.)", f"₦{summary['net_profit']:,.0f}")
 
     st.caption(
-        f"Salaries paid in period: ₦{summary['salary_paid']:,.0f}. "
-        "Record daily costs under **Expenses** and salary payments under **Staff & Salaries**."
+        f"Salaries paid in this period: ₦{summary['salary_paid']:,.0f}. "
+        "Record costs under **Expenses** and salary under **Staff & Salaries**."
     )
-
-    st.divider()
-    st.subheader("At a glance")
-    g1, g2, g3, g4, g5 = st.columns(5)
-    today_str = today.isoformat()
-    today_sales = sales[sales["sale_date"] == today_str] if not sales.empty else pd.DataFrame()
-    g1.metric("Today's sales (Main)", f"₦{today_sales['amount'].sum():,.0f}" if not today_sales.empty else "₦0")
-    g2.metric("Active staff", len(staff))
-    g3.metric("Monthly payroll (active)", f"₦{staff['monthly_salary'].sum():,.0f}" if not staff.empty else "₦0")
-    g4.metric("Low product stock", len(low_stock))
-    g5.metric("Raw materials value", f"₦{inv_val:,.0f}")
-
-    if low_raw:
-        st.warning(f"**{low_raw} raw material(s)** at or below reorder level — check **Raw Materials**.")
-    if not low_stock.empty:
-        st.warning(f"**{len(low_stock)} finished product(s)** low or out of stock — check **View Stock**.")
-
-    st.divider()
-    left, right = st.columns(2)
-    with left:
-        st.subheader("Low / out of stock products")
-        if low_stock.empty:
-            st.success("All products are well stocked.")
-        else:
-            st.dataframe(
-                low_stock[["name", "current_stock", "unit_price"]].rename(
-                    columns={"name": "Product", "current_stock": "Stock", "unit_price": "Price (₦)"}
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-    with right:
-        st.subheader("Recent expenses")
-        exp = get_expenses_df(d0, d1)
-        if exp.empty:
-            st.info("No expenses in this period. Record them under **Expenses**.")
-        else:
-            show = exp.head(10)[["expense_date", "category", "description", "amount", "branch"]].copy()
-            show.columns = ["Date", "Category", "Description", "Amount (₦)", "Branch"]
-            st.dataframe(show, use_container_width=True, hide_index=True)
 
 
 # ─────────────────────────────────────────────
