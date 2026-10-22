@@ -98,10 +98,19 @@ def init_db():
             name TEXT UNIQUE NOT NULL,
             sku TEXT,
             unit_price REAL NOT NULL DEFAULT 0,
+            cost_price REAL NOT NULL DEFAULT 0,
             current_stock REAL NOT NULL DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # migrate cost_price on older DBs
+    try:
+        cur.execute("PRAGMA table_info(products)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "cost_price" not in cols:
+            cur.execute("ALTER TABLE products ADD COLUMN cost_price REAL NOT NULL DEFAULT 0")
+    except Exception:
+        pass
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sales (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -281,6 +290,8 @@ def init_db():
             ("1000", "Cash", "Asset"),
             ("1100", "Bank / Transfer", "Asset"),
             ("1200", "Raw materials inventory", "Asset"),
+            ("2000", "Accounts payable (suppliers)", "Liability"),
+            ("2100", "Loans payable", "Liability"),
             ("4000", "Sales - Main", "Income"),
             ("4100", "Sales - Punch", "Income"),
             ("4200", "Sales - Special orders", "Income"),
@@ -288,8 +299,27 @@ def init_db():
             ("5100", "Spoilage / waste", "Expense"),
             ("5200", "Operating expenses", "Expense"),
             ("5300", "Salaries", "Expense"),
+            ("5400", "Interest expense", "Expense"),
+            ("5050", "Cost of goods sold", "Expense"),
+            ("1250", "Finished goods inventory", "Asset"),
+            ("3000", "Opening balance equity", "Equity"),
         ]
         for code, name, atype in default_accounts:
+            cur.execute(
+                "INSERT INTO accounts (code, name, account_type, is_active) VALUES (?, ?, ?, 1)",
+                (code, name, atype),
+            )
+    # Ensure liability accounts exist on older databases
+    for code, name, atype in [
+        ("2000", "Accounts payable (suppliers)", "Liability"),
+        ("2100", "Loans payable", "Liability"),
+        ("5400", "Interest expense", "Expense"),
+        ("5050", "Cost of goods sold", "Expense"),
+        ("1250", "Finished goods inventory", "Asset"),
+        ("3000", "Opening balance equity", "Equity"),
+    ]:
+        cur.execute("SELECT id FROM accounts WHERE code = ?", (code,))
+        if not cur.fetchone():
             cur.execute(
                 "INSERT INTO accounts (code, name, account_type, is_active) VALUES (?, ?, ?, 1)",
                 (code, name, atype),
@@ -299,8 +329,8 @@ def init_db():
     if cur.fetchone()[0] == 0:
         for name, sku, price, stock in DEFAULT_PRODUCTS:
             cur.execute(
-                "INSERT INTO products (name, sku, unit_price, current_stock) VALUES (?, ?, ?, ?)",
-                (name, sku, price, stock),
+                "INSERT INTO products (name, sku, unit_price, cost_price, current_stock) VALUES (?, ?, ?, ?, ?)",
+                (name, sku, price, 0, stock),
             )
 
     cur.execute("SELECT COUNT(*) FROM raw_materials")
@@ -384,7 +414,7 @@ def change_role_code(role: str, new_code: str):
 def get_all_products():
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT id, name, sku, unit_price, current_stock FROM products ORDER BY name",
+        "SELECT id, name, sku, unit_price, COALESCE(cost_price, 0) AS cost_price, current_stock FROM products ORDER BY name",
         conn,
     )
     conn.close()
@@ -436,9 +466,13 @@ def add_sale(sale_date, product_id, units_sold, notes="", unit_price=None, payme
     finally:
         conn.close()
 
-    # Auto journal: Dr Cash/Bank, Cr Sales - Main
+    # Auto journal: revenue + COGS
     try:
         auto_journal_sale(sale_date, amount, prod["name"], uid, payment=payment_method or "Cash")
+        cost_p = float(prod.get("cost_price") or 0)
+        cogs_amt = units * cost_p
+        if cogs_amt > 0:
+            auto_journal_cogs(sale_date, cogs_amt, prod["name"], uid)
     except Exception:
         pass
     return uid, None
@@ -519,21 +553,38 @@ def get_daily_totals():
     return df
 
 
-def update_product_price(product_id, new_price):
+def update_product_price(product_id, new_price, cost_price=None):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("UPDATE products SET unit_price = ? WHERE id = ?", (new_price, product_id))
+    if cost_price is None:
+        cur.execute("UPDATE products SET unit_price = ? WHERE id = ?", (float(new_price), product_id))
+    else:
+        cur.execute(
+            "UPDATE products SET unit_price = ?, cost_price = ? WHERE id = ?",
+            (float(new_price), float(cost_price), product_id),
+        )
     conn.commit()
     conn.close()
+    return True, None
 
 
-def add_new_product(name, sku, price, stock):
+def update_product_cost(product_id, cost_price):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE products SET cost_price = ? WHERE id = ?", (float(cost_price), product_id))
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+
+def add_new_product(name, sku, price, stock, cost_price=0):
     conn = get_conn()
     cur = conn.cursor()
     try:
         cur.execute(
-            "INSERT INTO products (name, sku, unit_price, current_stock) VALUES (?, ?, ?, ?)",
-            (name, sku, price, stock),
+            "INSERT INTO products (name, sku, unit_price, cost_price, current_stock) VALUES (?, ?, ?, ?, ?)",
+            (name, sku, price, float(cost_price or 0), stock),
         )
         conn.commit()
         return True, None
@@ -547,29 +598,34 @@ def add_new_product(name, sku, price, stock):
 
 
 def delete_sale(sale_id: int):
-    """Delete a sale and restore the stock that was deducted."""
+    """Delete a sale, restore stock, and reverse related journals (sale + COGS)."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT product_id, units_sold FROM sales WHERE id = ?", (sale_id,))
+    cur.execute("SELECT product_id, units_sold, unique_id FROM sales WHERE id = ?", (sale_id,))
     row = cur.fetchone()
     if not row:
         conn.close()
         return False, "Sale not found"
     product_id, units = row["product_id"], float(row["units_sold"])
+    sale_uid = row["unique_id"]
     try:
-        # Restore stock
         cur.execute(
             "UPDATE products SET current_stock = current_stock + ? WHERE id = ?",
             (units, product_id),
         )
         cur.execute("DELETE FROM sales WHERE id = ?", (sale_id,))
         conn.commit()
-        return True, None
     except Exception as e:
         conn.rollback()
         return False, str(e)
     finally:
         conn.close()
+    try:
+        reverse_journals_for_source("sale", sale_uid, reason="Sale deleted")
+        reverse_journals_for_source("cogs", sale_uid, reason="Sale deleted")
+    except Exception:
+        pass
+    return True, None
 
 
 def update_sale(sale_id: int, new_units: float, notes: str = ""):
@@ -790,6 +846,32 @@ def reset_all_stocks():
 
 
 # ─── Special Orders ───
+
+def reset_accounts(confirm_text=""):
+    """Delete all journal entries and lines. Chart of accounts is kept.
+    Pass confirm_text='RESET' to proceed.
+    """
+    if confirm_text.strip().upper() != "RESET":
+        return False, "Type RESET to confirm"
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM journal_lines")
+        cur.execute("DELETE FROM journal_entries")
+        try:
+            cur.execute("DELETE FROM sqlite_sequence WHERE name IN ('journal_lines', 'journal_entries')")
+        except Exception:
+            pass
+        conn.commit()
+        return True, None
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+
 def add_special_order(order_date, customer_name, product_description, quantity, unit_price, status="Pending", notes=""):
     qty = float(quantity)
     price = float(unit_price)
@@ -1089,7 +1171,7 @@ def get_products_in_stock_first():
     """Products sorted: those with stock > 0 first, then by name."""
     conn = get_conn()
     df = pd.read_sql_query(
-        """SELECT id, name, sku, unit_price, current_stock FROM products
+        """SELECT id, name, sku, unit_price, COALESCE(cost_price, 0) AS cost_price, current_stock FROM products
            ORDER BY CASE WHEN current_stock > 0 THEN 0 ELSE 1 END, current_stock DESC, name""",
         conn,
     )
@@ -1181,7 +1263,7 @@ def delete_raw_material(material_id):
         conn.close()
 
 
-def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=None, total_amount=None, notes=""):
+def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=None, total_amount=None, notes="", amount_paid=None, payment_method="Cash"):
     """
     movement_type:
       purchase / received  -> increase
@@ -1267,7 +1349,15 @@ def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=
     # Auto journals
     try:
         if movement_type in ("purchase", "received") and total and float(total) > 0:
-            auto_journal_raw_purchase(move_date, float(total), mat["name"], uid, payment="Cash")
+            paid = amount_paid if amount_paid is not None else float(total)
+            auto_journal_raw_purchase(
+                move_date,
+                float(total),
+                mat["name"],
+                uid,
+                payment=payment_method or "Cash",
+                amount_paid=paid,
+            )
         elif movement_type in ("used_in_production", "waste_spoilage"):
             usage_amt = qty * float(old_cost or 0)
             if usage_amt > 0:
@@ -1291,7 +1381,7 @@ def get_raw_movements_df(start_date=None, end_date=None):
 
 
 def delete_raw_movement(move_id, force=False):
-    """Reverse movement effect and delete record."""
+    """Reverse stock effect, delete movement, reverse related journals."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM raw_material_movements WHERE id = ?", (move_id,))
@@ -1302,8 +1392,8 @@ def delete_raw_movement(move_id, force=False):
     material_id = row["material_id"]
     mtype = row["movement_type"]
     qty = float(row["quantity"])
+    move_uid = row["unique_id"]
     increase_types = ("purchase", "received", "adjustment_in")
-    # Reverse
     if mtype in increase_types:
         delta = -qty
     else:
@@ -1323,16 +1413,22 @@ def delete_raw_movement(move_id, force=False):
         cur.execute("UPDATE raw_materials SET current_qty = ? WHERE id = ?", (new_qty, material_id))
         cur.execute("DELETE FROM raw_material_movements WHERE id = ?", (move_id,))
         conn.commit()
-        return True, None
     except Exception as e:
         conn.rollback()
         return False, str(e)
     finally:
         conn.close()
+    try:
+        if mtype in ("purchase", "received"):
+            reverse_journals_for_source("raw_purchase", move_uid, reason="Purchase deleted")
+        elif mtype in ("used_in_production", "waste_spoilage"):
+            reverse_journals_for_source("raw_usage", move_uid, reason="Usage deleted")
+    except Exception:
+        pass
+    return True, None
 
 
 
-# ─── Expenses ───
 def add_expense(expense_date, category, description, amount, branch="Main", payment_method="Cash", notes=""):
     amt = float(amount)
     if amt <= 0:
@@ -1379,15 +1475,23 @@ def get_expenses_df(start_date=None, end_date=None, branch=None):
 def delete_expense(exp_id):
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("SELECT unique_id FROM expenses WHERE id = ?", (exp_id,))
+    row = cur.fetchone()
+    uid = row["unique_id"] if row else None
     try:
         cur.execute("DELETE FROM expenses WHERE id = ?", (exp_id,))
         conn.commit()
-        return True, None
     except Exception as e:
         conn.rollback()
         return False, str(e)
     finally:
         conn.close()
+    if uid:
+        try:
+            reverse_journals_for_source("expense", uid, reason="Expense deleted")
+        except Exception:
+            pass
+    return True, None
 
 
 # ─── Staff ───
@@ -1670,22 +1774,78 @@ def auto_journal_sale(sale_date, amount, product_name, sale_uid, payment="Cash")
     )
 
 
-def auto_journal_raw_purchase(move_date, total_amount, material_name, move_uid, payment="Cash"):
-    """Dr Raw materials inventory, Cr Cash/Bank"""
+def auto_journal_raw_purchase(
+    move_date, total_amount, material_name, move_uid, payment="Cash", amount_paid=None
+):
+    """Dr Inventory; Cr Cash (paid now) and/or Accounts payable (on credit)."""
+    total_amount = float(total_amount)
     if total_amount <= 0:
         return None, "No amount to post"
+    if amount_paid is None:
+        paid = total_amount
+    else:
+        paid = max(0.0, min(float(amount_paid), total_amount))
+    on_credit = total_amount - paid
     cash_code = payment_account_code(payment)
-    lines = [
-        {"account_code": "1200", "debit": total_amount, "credit": 0},
-        {"account_code": cash_code, "debit": 0, "credit": total_amount},
-    ]
+    lines = [{"account_code": "1200", "debit": total_amount, "credit": 0}]
+    if paid > 0:
+        lines.append({"account_code": cash_code, "debit": 0, "credit": paid})
+    if on_credit > 0:
+        lines.append({"account_code": "2000", "debit": 0, "credit": on_credit})
     return post_journal(
         move_date,
-        f"Purchase: {material_name}",
+        f"Purchase: {material_name}"
+        + (f" (paid ₦{paid:,.0f}, credit ₦{on_credit:,.0f})" if on_credit > 0 else ""),
         lines,
         source_type="raw_purchase",
         source_id=move_uid,
     )
+
+
+def auto_journal_supplier_payment(pay_date, amount, supplier_name, pay_uid, payment="Cash"):
+    """Pay what is owed: Dr Accounts payable, Cr Cash/Bank."""
+    amount = float(amount)
+    if amount <= 0:
+        return None, "Amount must be greater than 0"
+    cash_code = payment_account_code(payment)
+    narr = "Supplier payment" + (f": {supplier_name}" if supplier_name else "")
+    lines = [
+        {"account_code": "2000", "debit": amount, "credit": 0},
+        {"account_code": cash_code, "debit": 0, "credit": amount},
+    ]
+    return post_journal(pay_date, narr, lines, source_type="supplier_payment", source_id=pay_uid)
+
+
+def auto_journal_loan_received(recv_date, amount, lender, loan_uid, payment="Cash"):
+    """Dr Cash/Bank, Cr Loans payable."""
+    amount = float(amount)
+    if amount <= 0:
+        return None, "Amount must be greater than 0"
+    cash_code = payment_account_code(payment)
+    narr = "Loan received" + (f": {lender}" if lender else "")
+    lines = [
+        {"account_code": cash_code, "debit": amount, "credit": 0},
+        {"account_code": "2100", "debit": 0, "credit": amount},
+    ]
+    return post_journal(recv_date, narr, lines, source_type="loan_received", source_id=loan_uid)
+
+
+def auto_journal_loan_repay(pay_date, principal, interest, lender, loan_uid, payment="Cash"):
+    """Dr Loans payable (+ interest expense), Cr Cash/Bank."""
+    principal = float(principal or 0)
+    interest = float(interest or 0)
+    total = principal + interest
+    if total <= 0:
+        return None, "Amount must be greater than 0"
+    cash_code = payment_account_code(payment)
+    narr = "Loan repayment" + (f": {lender}" if lender else "")
+    lines = []
+    if principal > 0:
+        lines.append({"account_code": "2100", "debit": principal, "credit": 0})
+    if interest > 0:
+        lines.append({"account_code": "5400", "debit": interest, "credit": 0})
+    lines.append({"account_code": cash_code, "debit": 0, "credit": total})
+    return post_journal(pay_date, narr, lines, source_type="loan_repay", source_id=loan_uid)
 
 
 def payment_account_code(payment="Cash"):
@@ -1694,6 +1854,7 @@ def payment_account_code(payment="Cash"):
     if p in ("transfer", "bank", "pos", "card"):
         return "1100"
     return "1000"
+
 
 
 def journal_exists_for_source(source_type, source_id):
@@ -1708,6 +1869,142 @@ def journal_exists_for_source(source_type, source_id):
     row = cur.fetchone()
     conn.close()
     return row is not None
+
+
+def reverse_journals_for_source(source_type, source_id, reason="Void"):
+    """Post reversing entries for all journals linked to a source, then mark originals.
+    Creates equal-and-opposite lines so trial balance stays clean.
+    """
+    if not source_id:
+        return 0, "No source id"
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT id, unique_id, entry_date, description FROM journal_entries
+           WHERE source_type = ? AND source_id = ?
+           AND (description IS NULL OR description NOT LIKE 'REV:%')""",
+        (source_type, source_id),
+    )
+    entries = cur.fetchall()
+    conn.close()
+    if not entries:
+        return 0, None
+    count = 0
+    for ent in entries:
+        lines_df = get_journal_lines_df(ent["id"])
+        if lines_df is None or lines_df.empty:
+            continue
+        rev_lines = []
+        for _, ln in lines_df.iterrows():
+            dr = float(ln["debit"] or 0)
+            cr = float(ln["credit"] or 0)
+            # swap
+            rev_lines.append({
+                "account_code": ln["account_code"],
+                "debit": cr,
+                "credit": dr,
+            })
+        # filter zero lines
+        rev_lines = [x for x in rev_lines if x["debit"] > 0 or x["credit"] > 0]
+        if not rev_lines:
+            continue
+        desc = f"REV: {reason} — {ent['description'] or ent['unique_id']}"
+        juid, err = post_journal(
+            ent["entry_date"],
+            desc,
+            rev_lines,
+            source_type=f"rev_{source_type}",
+            source_id=source_id,
+        )
+        if not err:
+            count += 1
+    return count, None
+
+
+def auto_journal_cogs(sale_date, cogs_amount, product_name, sale_uid):
+    """Dr Cost of goods sold, Cr Finished goods inventory."""
+    cogs_amount = float(cogs_amount or 0)
+    if cogs_amount <= 0:
+        return None, "No COGS"
+    lines = [
+        {"account_code": "5050", "debit": cogs_amount, "credit": 0},
+        {"account_code": "1250", "debit": 0, "credit": cogs_amount},
+    ]
+    return post_journal(
+        sale_date,
+        f"COGS: {product_name}",
+        lines,
+        source_type="cogs",
+        source_id=sale_uid,
+    )
+
+
+def post_opening_balances(entry_date, balances: dict, notes=""):
+    """
+    balances keys: cash, bank, raw_inventory, finished_goods, payables, loans
+    All amounts >= 0. Posts one balanced journal vs Opening balance equity (3000).
+    """
+    cash = float(balances.get("cash") or 0)
+    bank = float(balances.get("bank") or 0)
+    raw_inv = float(balances.get("raw_inventory") or 0)
+    fg = float(balances.get("finished_goods") or 0)
+    payables = float(balances.get("payables") or 0)
+    loans = float(balances.get("loans") or 0)
+
+    lines = []
+    if cash > 0:
+        lines.append({"account_code": "1000", "debit": cash, "credit": 0})
+    if bank > 0:
+        lines.append({"account_code": "1100", "debit": bank, "credit": 0})
+    if raw_inv > 0:
+        lines.append({"account_code": "1200", "debit": raw_inv, "credit": 0})
+    if fg > 0:
+        lines.append({"account_code": "1250", "debit": fg, "credit": 0})
+    if payables > 0:
+        lines.append({"account_code": "2000", "debit": 0, "credit": payables})
+    if loans > 0:
+        lines.append({"account_code": "2100", "debit": 0, "credit": loans})
+
+    total_dr = sum(x["debit"] for x in lines)
+    total_cr = sum(x["credit"] for x in lines)
+    equity = total_dr - total_cr
+    if abs(equity) < 0.01 and total_dr == 0:
+        return None, "Enter at least one opening amount"
+    if equity > 0:
+        lines.append({"account_code": "3000", "debit": 0, "credit": equity})
+    elif equity < 0:
+        lines.append({"account_code": "3000", "debit": abs(equity), "credit": 0})
+
+    uid = f"OB-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+    desc = "Opening balances" + (f" — {notes}" if notes else "")
+    return post_journal(entry_date, desc, lines, source_type="opening_balance", source_id=uid)
+
+
+def get_cogs_summary(start_date=None, end_date=None):
+    """Sum COGS from journals and sales revenue for gross profit."""
+    conn = get_conn()
+    q_cogs = """
+        SELECT COALESCE(SUM(jl.debit), 0) AS cogs
+        FROM journal_lines jl
+        JOIN journal_entries je ON je.id = jl.journal_id
+        WHERE jl.account_code = '5050'
+    """
+    q_sales = """
+        SELECT COALESCE(SUM(jl.credit - jl.debit), 0) AS sales
+        FROM journal_lines jl
+        JOIN journal_entries je ON je.id = jl.journal_id
+        WHERE jl.account_code IN ('4000', '4100', '4200')
+    """
+    params = []
+    if start_date and end_date:
+        q_cogs += " AND je.entry_date BETWEEN ? AND ?"
+        q_sales += " AND je.entry_date BETWEEN ? AND ?"
+        params = [start_date, end_date]
+    cogs = float(pd.read_sql_query(q_cogs, conn, params=params).iloc[0]["cogs"])
+    sales = float(pd.read_sql_query(q_sales, conn, params=params).iloc[0]["sales"])
+    conn.close()
+    return {"sales": sales, "cogs": cogs, "gross_profit": sales - cogs}
+
 
 
 def auto_journal_expense(expense_date, amount, category, description, exp_uid, payment="Cash"):
@@ -1824,7 +2121,7 @@ def get_ledger_for_account(account_code, start_date=None, end_date=None):
     atype = acc.iloc[0]["account_type"] if not acc.empty else "Asset"
     # Normal debit balance: Asset, Expense
     # Normal credit balance: Income (and Liability/Equity if added later)
-    normal_debit = atype in ("Asset", "Expense")
+    normal_debit = atype in ("Asset", "Expense")  # Liability, Equity, Income = credit normal
     running = 0.0
     balances = []
     for _, r in df.iterrows():
@@ -1875,7 +2172,7 @@ def get_trial_balance(start_date=None, end_date=None):
             else:
                 df.at[i, "balance_credit"] = abs(net)
         else:
-            # Income (credit normal)
+            # Income, Liability, Equity (credit normal)
             if net <= 0:
                 df.at[i, "balance_credit"] = abs(net)
             else:
@@ -2536,7 +2833,7 @@ elif page == "Raw Materials":
                 with c1:
                     move_date = st.date_input("Date", value=date.today(), key="raw_move_date")
                     mat_map = {
-                        f"{r['name']}  ·  {r['current_qty']:.2f} {r['unit']}": r["id"]
+                        f"{r['name']}  ·  stock {r['current_qty']:.2f} {r['unit']}": r["id"]
                         for _, r in materials.iterrows()
                     }
                     mat_label = st.selectbox("Material", list(mat_map.keys()))
@@ -2559,58 +2856,112 @@ elif page == "Raw Materials":
                             "adjustment_out": "Adjustment out (remove)",
                         }[x],
                     )
-                    qty = st.number_input("Quantity", min_value=0.0, step=0.5, value=1.0)
                 mat = get_raw_material_by_id(material_id)
-                unit_label = mat["unit"] if mat else "unit"
-                # For purchases: enter total amount paid → unit cost calculated
+                unit_label = (mat["unit"] if mat else "unit") or "unit"
+                st.markdown(f"**Unit of measure:** `{unit_label}` (e.g. kg, litres, crates, cl)")
+                qty = st.number_input(
+                    f"Quantity (number of {unit_label})",
+                    min_value=0.0,
+                    step=0.5,
+                    value=1.0,
+                    help=f"How many {unit_label} moved in this transaction.",
+                    key="raw_qty",
+                )
                 total_paid = 0.0
-                cost = float(mat["unit_cost"]) if mat else 0.0
+                total_cost = 0.0
+                amount_paid_now = 0.0
+                pay_method = "Cash"
                 if mtype in ("purchase", "received"):
-                    st.markdown("**Purchase cost**")
-                    total_paid = st.number_input(
-                        "Total amount paid (₦) *",
+                    st.markdown("**Purchase details**")
+                    total_cost = st.number_input(
+                        "Total cost of goods (₦) *",
                         min_value=0.0,
                         step=100.0,
                         value=0.0,
-                        help="What you paid for this quantity in total.",
-                        key="raw_total_paid",
+                        help="Full value of this purchase (what the goods cost).",
+                        key="raw_total_cost",
                     )
-                    if qty > 0 and total_paid > 0:
-                        auto_unit = total_paid / qty
-                        st.success(
-                            f"**Unit cost (auto):** ₦{auto_unit:,.2f} per {unit_label}  "
-                            f"(₦{total_paid:,.0f} ÷ {qty:g})"
+                    p1, p2, p3 = st.columns(3)
+                    with p1:
+                        amount_paid_now = st.number_input(
+                            "Amount paid now (₦)",
+                            min_value=0.0,
+                            step=100.0,
+                            value=0.0,
+                            help="What you paid today. Leave 0 if fully on credit.",
+                            key="raw_paid_now",
                         )
+                    with p2:
+                        on_credit = max(0.0, float(total_cost) - float(amount_paid_now))
+                        st.metric("On credit (₦)", f"{on_credit:,.0f}")
+                    with p3:
+                        if qty > 0 and total_cost > 0:
+                            st.metric(f"Price per {unit_label}", f"₦{total_cost/qty:,.2f}")
+                        else:
+                            st.metric(f"Price per {unit_label}", "—")
+                    pay_method = st.selectbox(
+                        "Payment method (for amount paid now)",
+                        ["Cash", "Transfer", "POS"],
+                        key="raw_pay_method",
+                    )
+                    if total_cost > 0:
+                        if amount_paid_now > total_cost:
+                            st.error("Amount paid now cannot be more than total cost.")
+                        elif on_credit > 0 and amount_paid_now > 0:
+                            st.info(
+                                f"Inventory +₦{total_cost:,.0f}  ·  "
+                                f"Cash out ₦{amount_paid_now:,.0f}  ·  "
+                                f"**Owed to supplier ₦{on_credit:,.0f}**"
+                            )
+                        elif on_credit > 0:
+                            st.info(
+                                f"Fully on credit: Inventory +₦{total_cost:,.0f}  ·  "
+                                f"**Payable ₦{on_credit:,.0f}** (no cash out)"
+                            )
+                        else:
+                            st.success(
+                                f"Fully paid: {qty:g} {unit_label} @ ₦{total_cost/qty:,.2f} = ₦{total_cost:,.0f}"
+                            )
                     else:
-                        st.caption("Enter quantity and total amount paid to get unit cost automatically.")
-                notes = st.text_input("Notes", placeholder="e.g. from market, used for cake batch")
+                        st.caption(
+                            f"Enter quantity ({unit_label}), total cost, and how much you paid now."
+                        )
+                notes = st.text_input("Notes", placeholder="e.g. supplier name, market")
                 if st.form_submit_button("Save Movement", type="primary", use_container_width=True):
                     if mtype in ("purchase", "received"):
-                        uid, err = add_raw_movement(
-                            move_date.isoformat(),
-                            material_id,
-                            mtype,
-                            qty,
-                            total_amount=total_paid if total_paid > 0 else None,
-                            notes=notes,
-                        )
+                        if total_cost <= 0:
+                            st.error("Enter total cost of the goods.")
+                        elif amount_paid_now > total_cost:
+                            st.error("Amount paid now cannot exceed total cost.")
+                        else:
+                            uid, err = add_raw_movement(
+                                move_date.isoformat(),
+                                material_id,
+                                mtype,
+                                qty,
+                                total_amount=total_cost,
+                                notes=notes,
+                                amount_paid=amount_paid_now,
+                                payment_method=pay_method,
+                            )
+                            if err:
+                                st.error(err)
+                            else:
+                                oc = total_cost - amount_paid_now
+                                msg = f"Saved · **{uid}** · {qty:g} {unit_label}"
+                                if oc > 0:
+                                    msg += f" · On credit ₦{oc:,.0f}"
+                                st.success(msg)
+                                st.rerun()
                     else:
                         uid, err = add_raw_movement(
                             move_date.isoformat(), material_id, mtype, qty, notes=notes
                         )
-                    if err:
-                        st.error(err)
-                    else:
-                        if mtype in ("purchase", "received") and qty > 0 and total_paid > 0:
-                            batch = total_paid / qty
-                            st.success(
-                                f"Saved  ·  **{uid}**  ·  "
-                                f"This purchase ₦{batch:,.2f}/{unit_label}  ·  "
-                                f"Average cost updated (weighted average)"
-                            )
+                        if err:
+                            st.error(err)
                         else:
                             st.success(f"Saved  ·  **{uid}**")
-                        st.rerun()
+                            st.rerun()
 
             st.divider()
             st.subheader("Delete a movement")
@@ -3193,9 +3544,14 @@ elif page == "Products":
             st.info("No products yet. Add products in the next tab.")
         else:
             disp = products.copy()
+            if "cost_price" not in disp.columns:
+                disp["cost_price"] = 0
             disp["unit_price"] = disp["unit_price"].apply(lambda x: f"₦{x:,.0f}")
-            disp.columns = ["ID", "Product", "SKU", "Unit Price", "Current Stock"]
+            disp["cost_price"] = disp["cost_price"].apply(lambda x: f"₦{float(x):,.0f}")
+            disp = disp[["id", "name", "sku", "unit_price", "cost_price", "current_stock"]]
+            disp.columns = ["ID", "Product", "SKU", "Sell Price", "Cost Price", "Stock"]
             st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.caption("Cost price is used for COGS when a sale is recorded (Gross profit = Sales − COGS).")
             st.caption(f"Total products: {len(products)}")
 
         st.divider()
@@ -3221,7 +3577,14 @@ elif page == "Products":
                 name = st.text_input("Product Name *", placeholder="e.g. Chocolate Cake")
                 sku = st.text_input("SKU (optional)", placeholder="e.g. CC01")
             with n2:
-                price = st.number_input("Unit Price (₦) *", min_value=0.0, step=50.0, value=500.0)
+                price = st.number_input("Selling Price (₦) *", min_value=0.0, step=50.0, value=500.0)
+                cost = st.number_input(
+                    "Cost Price (₦)",
+                    min_value=0.0,
+                    step=50.0,
+                    value=0.0,
+                    help="What it costs Funlex to make/buy this item. Used for COGS.",
+                )
                 stock = st.number_input("Opening Stock", min_value=0.0, step=1.0, value=0.0)
             if st.form_submit_button("Add Product", type="primary", use_container_width=True):
                 if not name.strip():
@@ -3229,7 +3592,7 @@ elif page == "Products":
                 elif price <= 0:
                     st.error("Price must be greater than 0.")
                 else:
-                    ok, err = add_new_product(name.strip(), sku.strip(), price, stock)
+                    ok, err = add_new_product(name.strip(), sku.strip(), price, stock, cost_price=cost)
                     if ok:
                         st.success(f"Product **{name.strip()}** added successfully.")
                         st.rerun()
@@ -3251,11 +3614,20 @@ elif page == "Products":
             new_name = st.text_input("Product Name (fix spelling here)", value=current["name"], key="edit_pname")
             new_sku = st.text_input("SKU", value=current["sku"] or "", key="edit_psku")
             new_price = st.number_input(
-                "Unit Price (₦)",
+                "Selling Price (₦)",
                 min_value=0.0,
                 value=float(current["unit_price"]),
                 step=50.0,
                 key="edit_pprice",
+            )
+            cur_cost = float(current["cost_price"]) if "cost_price" in current.index else 0.0
+            new_cost = st.number_input(
+                "Cost Price (₦) — for COGS",
+                min_value=0.0,
+                value=cur_cost,
+                step=50.0,
+                key="edit_pcost",
+                help="Cost to produce/buy this item. Sales will post COGS = units × cost price.",
             )
             st.caption(f"Current stock: **{current['current_stock']:.0f}** (change stock in Stock Tracker)")
 
@@ -3264,19 +3636,18 @@ elif page == "Products":
                 if st.button("Save Name & SKU", type="primary", key="btn_rename"):
                     ok, err = rename_product(pid, new_name, new_sku)
                     if ok:
-                        if new_price > 0 and float(new_price) != float(current["unit_price"]):
-                            update_product_price(pid, new_price)
+                        update_product_price(pid, new_price, cost_price=new_cost)
                         st.success(f"Product updated to **{new_name.strip()}**")
                         st.rerun()
                     else:
                         st.error(err)
             with b2:
-                if st.button("Update Price Only", key="btn_upd_price"):
+                if st.button("Update Prices", key="btn_upd_price"):
                     if new_price <= 0:
-                        st.error("Price must be greater than 0.")
+                        st.error("Selling price must be greater than 0.")
                     else:
-                        update_product_price(pid, new_price)
-                        st.success(f"Price updated to ₦{new_price:,.0f}")
+                        update_product_price(pid, new_price, cost_price=new_cost)
+                        st.success(f"Sell ₦{new_price:,.0f} · Cost ₦{new_cost:,.0f}")
                         st.rerun()
             with b3:
                 if st.button("Delete This Product", type="secondary", key="btn_del_one_prod"):
@@ -3697,8 +4068,8 @@ elif page == "Accounts":
     else:
         p0 = p1 = None
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Chart of accounts", "Journals", "Ledger", "Trial balance"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["Chart of accounts", "Journals", "Ledger", "Trial balance", "Payables & Loans", "Opening balances", "Reset accounts"]
     )
 
     with tab1:
@@ -3774,7 +4145,7 @@ elif page == "Accounts":
                 if atype in ("Asset", "Expense"):
                     st.caption("Positive balance = debit balance (normal for assets/expenses).")
                 else:
-                    st.caption("Positive balance = credit balance (normal for income).")
+                    st.caption("Positive balance = credit balance (normal for income / liabilities).")
 
     with tab4:
         st.subheader("Trial balance")
@@ -3820,10 +4191,176 @@ elif page == "Accounts":
             i1.metric("Income (sales etc.)", f"₦{inc_amt:,.0f}")
             i2.metric("Expenses (posted)", f"₦{exp_amt:,.0f}")
             i3.metric("Income − expenses", f"₦{inc_amt - exp_amt:,.0f}")
-            st.caption(
-                "Only accounts that received auto-journals appear. "
-                "Expenses and salaries will show here once those are auto-posted (future phase)."
-            )
+            try:
+                cogs_s = get_cogs_summary(p0, p1)
+                st.markdown("**Gross profit (Sales − COGS)**")
+                g1, g2, g3 = st.columns(3)
+                g1.metric("Sales (posted)", f"₦{cogs_s['sales']:,.0f}")
+                g2.metric("COGS", f"₦{cogs_s['cogs']:,.0f}")
+                g3.metric("Gross profit", f"₦{cogs_s['gross_profit']:,.0f}")
+                st.caption(
+                    "COGS posts when a product has **Cost Price** set and a sale is recorded. "
+                    "Set cost prices under **Products**."
+                )
+            except Exception:
+                pass
+
+    with tab5:
+        st.subheader("Payables & Loans")
+        st.caption(
+            "Pay suppliers for goods bought on credit, record loans received, and repay loans. "
+            "These post to Accounts payable (2000) and Loans payable (2100)."
+        )
+        sub1, sub2, sub3 = st.tabs(["Pay supplier", "Loan received", "Repay loan"])
+
+        with sub1:
+            st.markdown("**Reduce what you owe suppliers** (Dr Payable · Cr Cash/Bank)")
+            with st.form("supplier_pay_form", clear_on_submit=True):
+                sp1, sp2 = st.columns(2)
+                with sp1:
+                    sp_date = st.date_input("Payment date", value=date.today(), key="sp_date")
+                    sp_supplier = st.text_input("Supplier name", placeholder="e.g. Flour supplier")
+                with sp2:
+                    sp_amt = st.number_input("Amount paid (₦)", min_value=0.0, step=100.0, key="sp_amt")
+                    sp_pay = st.selectbox("Paid from", ["Cash", "Transfer"], key="sp_pay")
+                sp_notes = st.text_input("Notes", key="sp_notes")
+                if st.form_submit_button("Record supplier payment", type="primary"):
+                    if sp_amt <= 0:
+                        st.error("Enter amount.")
+                    else:
+                        uid = f"SPAY-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+                        juid, err = auto_journal_supplier_payment(
+                            sp_date.isoformat(), sp_amt, sp_supplier, uid, payment=sp_pay
+                        )
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success(f"Supplier payment posted · Journal **{juid}**")
+                            st.rerun()
+
+        with sub2:
+            st.markdown("**Money borrowed** (Dr Cash/Bank · Cr Loans payable)")
+            with st.form("loan_recv_form", clear_on_submit=True):
+                lr1, lr2 = st.columns(2)
+                with lr1:
+                    lr_date = st.date_input("Date received", value=date.today(), key="lr_date")
+                    lr_lender = st.text_input("Lender", placeholder="e.g. Bank, family")
+                with lr2:
+                    lr_amt = st.number_input("Amount received (₦)", min_value=0.0, step=1000.0, key="lr_amt")
+                    lr_into = st.selectbox("Received into", ["Cash", "Transfer"], key="lr_into")
+                if st.form_submit_button("Record loan received", type="primary"):
+                    if lr_amt <= 0:
+                        st.error("Enter amount.")
+                    else:
+                        uid = f"LOAN-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+                        juid, err = auto_journal_loan_received(
+                            lr_date.isoformat(), lr_amt, lr_lender, uid, payment=lr_into
+                        )
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success(f"Loan recorded · Journal **{juid}**")
+                            st.rerun()
+
+        with sub3:
+            st.markdown("**Repay loan** (Dr Loans payable + interest · Cr Cash/Bank)")
+            with st.form("loan_pay_form", clear_on_submit=True):
+                lp1, lp2 = st.columns(2)
+                with lp1:
+                    lp_date = st.date_input("Payment date", value=date.today(), key="lp_date")
+                    lp_lender = st.text_input("Lender", key="lp_lender")
+                    lp_prin = st.number_input("Principal (₦)", min_value=0.0, step=1000.0, key="lp_prin")
+                with lp2:
+                    lp_int = st.number_input("Interest (₦)", min_value=0.0, step=100.0, value=0.0, key="lp_int")
+                    lp_from = st.selectbox("Paid from", ["Cash", "Transfer"], key="lp_from")
+                st.caption(f"Total cash out: ₦{(0):,.0f} — enter principal and interest above.")
+                if st.form_submit_button("Record loan repayment", type="primary"):
+                    if lp_prin + lp_int <= 0:
+                        st.error("Enter principal and/or interest.")
+                    else:
+                        uid = f"LREP-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+                        juid, err = auto_journal_loan_repay(
+                            lp_date.isoformat(), lp_prin, lp_int, lp_lender, uid, payment=lp_from
+                        )
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success(f"Repayment posted · Journal **{juid}** · Total ₦{lp_prin+lp_int:,.0f}")
+                            st.rerun()
+
+        # Quick balances
+        st.divider()
+        try:
+            tb = get_trial_balance(None, None)
+            pay = tb[tb["account_code"] == "2000"] if not tb.empty else pd.DataFrame()
+            loan = tb[tb["account_code"] == "2100"] if not tb.empty else pd.DataFrame()
+            pay_bal = float(pay["balance_credit"].sum() - pay["balance_debit"].sum()) if not pay.empty else 0.0
+            # from trial balance columns
+            if not pay.empty:
+                pay_bal = float(pay.iloc[0]["total_credit"] - pay.iloc[0]["total_debit"])
+            if not loan.empty:
+                loan_bal = float(loan.iloc[0]["total_credit"] - loan.iloc[0]["total_debit"])
+            else:
+                loan_bal = 0.0
+            m1, m2 = st.columns(2)
+            m1.metric("Accounts payable (owed to suppliers)", f"₦{max(0, pay_bal):,.0f}")
+            m2.metric("Loans payable (outstanding)", f"₦{max(0, loan_bal):,.0f}")
+        except Exception:
+            pass
+
+    with tab6:
+        st.subheader("Opening balances")
+        st.caption(
+            "Use once when starting the books. Enter what Funlex already had "
+            "(cash, stock value, debts). Posts one balanced journal to Opening balance equity."
+        )
+        with st.form("opening_bal_form"):
+            ob_date = st.date_input("Opening date", value=date.today(), key="ob_date")
+            o1, o2 = st.columns(2)
+            with o1:
+                ob_cash = st.number_input("Cash on hand (₦)", min_value=0.0, step=1000.0, key="ob_cash")
+                ob_bank = st.number_input("Bank / transfer balance (₦)", min_value=0.0, step=1000.0, key="ob_bank")
+                ob_raw = st.number_input("Raw materials inventory value (₦)", min_value=0.0, step=1000.0, key="ob_raw")
+                ob_fg = st.number_input("Finished goods inventory value (₦)", min_value=0.0, step=1000.0, key="ob_fg")
+            with o2:
+                ob_pay = st.number_input("Accounts payable — suppliers owed (₦)", min_value=0.0, step=1000.0, key="ob_pay")
+                ob_loan = st.number_input("Loans payable (₦)", min_value=0.0, step=1000.0, key="ob_loan")
+                ob_notes = st.text_input("Notes", key="ob_notes")
+            if st.form_submit_button("Post opening balances", type="primary"):
+                juid, err = post_opening_balances(
+                    ob_date.isoformat(),
+                    {
+                        "cash": ob_cash,
+                        "bank": ob_bank,
+                        "raw_inventory": ob_raw,
+                        "finished_goods": ob_fg,
+                        "payables": ob_pay,
+                        "loans": ob_loan,
+                    },
+                    notes=ob_notes,
+                )
+                if err:
+                    st.error(err)
+                else:
+                    st.success(f"Opening balances posted · **{juid}**")
+                    st.rerun()
+
+    with tab7:
+        st.subheader("Reset accounts")
+        st.warning(
+            "This **deletes all journal entries and journal lines**. "
+            "Sales, stock, expenses and other operational data are **not** deleted. "
+            "The chart of accounts stays. Use this if you want to start the books from zero."
+        )
+        st.caption("Type **RESET** below, then confirm.")
+        confirm = st.text_input("Type RESET to enable wipe", key="acc_reset_confirm")
+        if st.button("Wipe all journals", type="primary", disabled=(confirm.strip().upper() != "RESET")):
+            ok, err = reset_accounts(confirm)
+            if ok:
+                st.success("All journals cleared. New sales and purchases will post fresh entries.")
+                st.rerun()
+            else:
+                st.error(err or "Could not reset.")
 
 
 elif page == "Settings":
@@ -3868,6 +4405,21 @@ elif page == "Settings":
         reset_all_stocks()
         st.success("All product stocks set to 0.")
         st.rerun()
+
+    st.divider()
+    st.subheader("Reset Accounts (journals only)")
+    st.caption(
+        "Clears all journal entries so accounting can start fresh. "
+        "Does not delete sales, stock, expenses or staff records."
+    )
+    conf2 = st.text_input("Type RESET to confirm accounts wipe", key="set_acc_reset")
+    if st.button("Wipe journals", type="secondary", disabled=(conf2.strip().upper() != "RESET")):
+        ok, err = reset_accounts(conf2)
+        if ok:
+            st.success("Journals cleared.")
+            st.rerun()
+        else:
+            st.error(err or "Failed.")
 
     st.divider()
     st.subheader("Database Info")
