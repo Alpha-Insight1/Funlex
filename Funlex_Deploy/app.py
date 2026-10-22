@@ -244,6 +244,56 @@ def init_db():
             FOREIGN KEY (staff_id) REFERENCES staff(id)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            account_type TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS journal_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unique_id TEXT UNIQUE NOT NULL,
+            entry_date TEXT NOT NULL,
+            description TEXT,
+            source_type TEXT,
+            source_id TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS journal_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            journal_id INTEGER NOT NULL,
+            account_code TEXT NOT NULL,
+            account_name TEXT NOT NULL,
+            debit REAL NOT NULL DEFAULT 0,
+            credit REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY (journal_id) REFERENCES journal_entries(id)
+        )
+    """)
+    cur.execute("SELECT COUNT(*) FROM accounts")
+    if cur.fetchone()[0] == 0:
+        default_accounts = [
+            ("1000", "Cash", "Asset"),
+            ("1100", "Bank / Transfer", "Asset"),
+            ("1200", "Raw materials inventory", "Asset"),
+            ("4000", "Sales - Main", "Income"),
+            ("4100", "Sales - Punch", "Income"),
+            ("4200", "Sales - Special orders", "Income"),
+            ("5000", "Cost of materials used", "Expense"),
+            ("5100", "Spoilage / waste", "Expense"),
+            ("5200", "Operating expenses", "Expense"),
+            ("5300", "Salaries", "Expense"),
+        ]
+        for code, name, atype in default_accounts:
+            cur.execute(
+                "INSERT INTO accounts (code, name, account_type, is_active) VALUES (?, ?, ?, 1)",
+                (code, name, atype),
+            )
 
     cur.execute("SELECT COUNT(*) FROM products")
     if cur.fetchone()[0] == 0:
@@ -380,12 +430,21 @@ def add_sale(sale_date, product_id, units_sold, notes="", unit_price=None):
         )
         cur.execute("UPDATE products SET current_stock = ? WHERE id = ?", (closing, product_id))
         conn.commit()
-        return uid, None
     except Exception as e:
         conn.rollback()
         return None, str(e)
     finally:
         conn.close()
+
+    # Phase 1 auto journal: Dr Cash, Cr Sales - Main
+    try:
+        juid, jerr = auto_journal_sale(sale_date, amount, prod["name"], uid, payment="Cash")
+        if jerr:
+            # Sale is saved; journal failure should not block the sale
+            pass
+    except Exception:
+        pass
+    return uid, None
 
 
 def add_stock_movement(move_date, product_id, movement_type, quantity, notes=""):
@@ -1174,12 +1233,19 @@ def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=
              qty, before, after, cost, total, notes),
         )
         conn.commit()
-        return uid, None
     except Exception as e:
         conn.rollback()
         return None, str(e)
     finally:
         conn.close()
+
+    # Phase 1 auto journal on purchase/received with amount
+    if movement_type in ("purchase", "received") and total and float(total) > 0:
+        try:
+            auto_journal_raw_purchase(move_date, float(total), mat["name"], uid, payment="Cash")
+        except Exception:
+            pass
+    return uid, None
 
 
 def get_raw_movements_df(start_date=None, end_date=None):
@@ -1439,6 +1505,150 @@ def get_branch_profit_summary(start_date=None, end_date=None):
         "punch_profit": punch_rev - punch_exp,
         "net_profit": main_rev + punch_rev - main_exp - punch_exp - salary_total,
     }
+
+
+
+# ─── Accounting Phase 1: Chart of accounts + journals ───
+def get_accounts_df(active_only=True):
+    conn = get_conn()
+    q = "SELECT * FROM accounts"
+    if active_only:
+        q += " WHERE is_active = 1"
+    q += " ORDER BY code"
+    df = pd.read_sql_query(q, conn)
+    conn.close()
+    return df
+
+
+def get_account_by_code(code: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM accounts WHERE code = ? AND is_active = 1", (code,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def post_journal(entry_date, description, lines, source_type="", source_id=""):
+    """
+    lines: list of dicts {account_code, debit, credit}
+    Debits must equal credits.
+    """
+    if not lines:
+        return None, "No journal lines"
+    total_dr = sum(float(x.get("debit", 0) or 0) for x in lines)
+    total_cr = sum(float(x.get("credit", 0) or 0) for x in lines)
+    if abs(total_dr - total_cr) > 0.01:
+        return None, f"Journal not balanced: Dr {total_dr:.2f} vs Cr {total_cr:.2f}"
+    if total_dr <= 0:
+        return None, "Journal amount must be greater than 0"
+
+    resolved = []
+    for ln in lines:
+        code = str(ln["account_code"])
+        acc = get_account_by_code(code)
+        if not acc:
+            return None, f"Account {code} not found"
+        dr = float(ln.get("debit", 0) or 0)
+        cr = float(ln.get("credit", 0) or 0)
+        if dr < 0 or cr < 0:
+            return None, "Debit/credit cannot be negative"
+        if dr > 0 and cr > 0:
+            return None, "A line cannot have both debit and credit"
+        resolved.append((code, acc["name"], dr, cr))
+
+    uid = f"JRN-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO journal_entries
+               (unique_id, entry_date, description, source_type, source_id)
+               VALUES (?, ?, ?, ?, ?)""",
+            (uid, entry_date, description, source_type, source_id),
+        )
+        jid = cur.lastrowid
+        for code, name, dr, cr in resolved:
+            cur.execute(
+                """INSERT INTO journal_lines
+                   (journal_id, account_code, account_name, debit, credit)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (jid, code, name, dr, cr),
+            )
+        conn.commit()
+        return uid, None
+    except Exception as e:
+        conn.rollback()
+        return None, str(e)
+    finally:
+        conn.close()
+
+
+def get_journals_df(start_date=None, end_date=None):
+    conn = get_conn()
+    q = "SELECT * FROM journal_entries"
+    params = []
+    if start_date and end_date:
+        q += " WHERE entry_date BETWEEN ? AND ?"
+        params = [start_date, end_date]
+    q += " ORDER BY entry_date DESC, id DESC"
+    df = pd.read_sql_query(q, conn, params=params)
+    conn.close()
+    return df
+
+
+def get_journal_lines_df(journal_id=None):
+    conn = get_conn()
+    if journal_id:
+        df = pd.read_sql_query(
+            "SELECT * FROM journal_lines WHERE journal_id = ? ORDER BY id",
+            conn,
+            params=[journal_id],
+        )
+    else:
+        df = pd.read_sql_query(
+            """SELECT jl.*, je.unique_id, je.entry_date, je.description, je.source_type
+               FROM journal_lines jl
+               JOIN journal_entries je ON je.id = jl.journal_id
+               ORDER BY je.entry_date DESC, jl.id""",
+            conn,
+        )
+    conn.close()
+    return df
+
+
+def auto_journal_sale(sale_date, amount, product_name, sale_uid, payment="Cash"):
+    """Dr Cash/Bank, Cr Sales - Main"""
+    cash_code = "1000" if payment == "Cash" else "1100"
+    lines = [
+        {"account_code": cash_code, "debit": amount, "credit": 0},
+        {"account_code": "4000", "debit": 0, "credit": amount},
+    ]
+    return post_journal(
+        sale_date,
+        f"Sale: {product_name}",
+        lines,
+        source_type="sale",
+        source_id=sale_uid,
+    )
+
+
+def auto_journal_raw_purchase(move_date, total_amount, material_name, move_uid, payment="Cash"):
+    """Dr Raw materials inventory, Cr Cash/Bank"""
+    if total_amount <= 0:
+        return None, "No amount to post"
+    cash_code = "1000" if payment == "Cash" else "1100"
+    lines = [
+        {"account_code": "1200", "debit": total_amount, "credit": 0},
+        {"account_code": cash_code, "debit": 0, "credit": total_amount},
+    ]
+    return post_journal(
+        move_date,
+        f"Purchase: {material_name}",
+        lines,
+        source_type="raw_purchase",
+        source_id=move_uid,
+    )
 
 
 def to_excel_bytes(dfs: dict) -> bytes:
@@ -1741,6 +1951,7 @@ with st.sidebar:
             "Special Orders",
             "Expenses",
             "Staff & Salaries",
+            "Accounts",
             "Daily Totals",
             "Products",
             "Export Excel",
@@ -3201,6 +3412,91 @@ elif page == "Staff & Salaries":
                 show = pays.head(20)[["unique_id", "pay_date", "staff_name", "period_label", "amount", "notes"]].copy()
                 show.columns = ["UID", "Date", "Staff", "Period", "Amount (₦)", "Notes"]
                 st.dataframe(show, use_container_width=True, hide_index=True)
+
+
+
+# ─────────────────────────────────────────────
+# ACCOUNTS (Phase 1)
+# ─────────────────────────────────────────────
+elif page == "Accounts":
+    if not is_admin:
+        st.error("Admin only.")
+        st.stop()
+
+    st.header("Accounts")
+    st.caption(
+        "Phase 1: Chart of accounts and auto journals. "
+        "Sales post **Dr Cash / Cr Sales – Main**. "
+        "Raw material purchases post **Dr Raw materials inventory / Cr Cash**."
+    )
+
+    tab1, tab2 = st.tabs(["Chart of accounts", "Journals"])
+
+    with tab1:
+        acc = get_accounts_df(active_only=False)
+        if acc.empty:
+            st.warning("No accounts found. Restart the app to seed defaults.")
+        else:
+            show = acc[["code", "name", "account_type", "is_active"]].copy()
+            show["is_active"] = show["is_active"].map({1: "Active", 0: "Inactive"})
+            show.columns = ["Code", "Account name", "Type", "Status"]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.info(
+                "Default accounts are fixed for Phase 1. "
+                "Ledger and trial balance come in Phase 2."
+            )
+
+    with tab2:
+        f1, f2 = st.columns(2)
+        with f1:
+            period = st.selectbox(
+                "Period",
+                ["This month", "Last 30 days", "All time"],
+                key="jrn_period",
+            )
+        today = date.today()
+        if period == "This month":
+            j0, j1 = today.replace(day=1).isoformat(), today.isoformat()
+        elif period == "Last 30 days":
+            from datetime import timedelta
+            j0 = (today - timedelta(days=30)).isoformat()
+            j1 = today.isoformat()
+        else:
+            j0 = j1 = None
+
+        journals = get_journals_df(j0, j1)
+        st.metric("Journal entries", len(journals))
+        if journals.empty:
+            st.info(
+                "No journals yet. Record a **sale** or a **raw material purchase** "
+                "(with total amount paid) to create the first entries."
+            )
+        else:
+            show = journals[["unique_id", "entry_date", "description", "source_type", "source_id"]].copy()
+            show.columns = ["Journal ID", "Date", "Description", "Source", "Source ID"]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+            st.subheader("Journal lines")
+            lines = get_journal_lines_df()
+            if j0 and j1 and not lines.empty:
+                lines = lines[(lines["entry_date"] >= j0) & (lines["entry_date"] <= j1)]
+            if lines.empty:
+                st.caption("No lines.")
+            else:
+                lshow = lines[
+                    ["entry_date", "unique_id", "account_code", "account_name", "debit", "credit", "description"]
+                ].copy()
+                lshow.columns = ["Date", "Journal", "Code", "Account", "Debit (₦)", "Credit (₦)", "Narration"]
+                st.dataframe(lshow, use_container_width=True, hide_index=True)
+                tot_dr = float(lshow["Debit (₦)"].sum())
+                tot_cr = float(lshow["Credit (₦)"].sum())
+                c1, c2 = st.columns(2)
+                c1.metric("Total debits", f"₦{tot_dr:,.0f}")
+                c2.metric("Total credits", f"₦{tot_cr:,.0f}")
+                if abs(tot_dr - tot_cr) < 1:
+                    st.success("Debits equal credits for the listed lines.")
+                else:
+                    st.warning("Debits and credits do not match — check entries.")
 
 
 elif page == "Settings":
