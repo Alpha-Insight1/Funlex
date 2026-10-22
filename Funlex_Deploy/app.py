@@ -202,6 +202,48 @@ def init_db():
             value TEXT
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unique_id TEXT UNIQUE NOT NULL,
+            expense_date TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT,
+            amount REAL NOT NULL,
+            branch TEXT NOT NULL DEFAULT 'Main',
+            payment_method TEXT DEFAULT 'Cash',
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS staff (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL,
+            role_title TEXT,
+            branch TEXT NOT NULL DEFAULT 'Main',
+            phone TEXT,
+            monthly_salary REAL NOT NULL DEFAULT 0,
+            start_date TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS salary_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unique_id TEXT UNIQUE NOT NULL,
+            staff_id INTEGER NOT NULL,
+            staff_name TEXT NOT NULL,
+            pay_date TEXT NOT NULL,
+            period_label TEXT,
+            amount REAL NOT NULL,
+            notes TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (staff_id) REFERENCES staff(id)
+        )
+    """)
 
     cur.execute("SELECT COUNT(*) FROM products")
     if cur.fetchone()[0] == 0:
@@ -1194,6 +1236,211 @@ def delete_raw_movement(move_id, force=False):
         conn.close()
 
 
+
+# ─── Expenses ───
+def add_expense(expense_date, category, description, amount, branch="Main", payment_method="Cash", notes=""):
+    amt = float(amount)
+    if amt <= 0:
+        return None, "Amount must be greater than 0"
+    uid = f"EXP-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO expenses
+               (unique_id, expense_date, category, description, amount, branch, payment_method, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (uid, expense_date, category, description, amt, branch, payment_method, notes),
+        )
+        conn.commit()
+        return uid, None
+    except Exception as e:
+        conn.rollback()
+        return None, str(e)
+    finally:
+        conn.close()
+
+
+def get_expenses_df(start_date=None, end_date=None, branch=None):
+    conn = get_conn()
+    q = "SELECT * FROM expenses WHERE 1=1"
+    params = []
+    if start_date and end_date:
+        q += " AND expense_date BETWEEN ? AND ?"
+        params.extend([start_date, end_date])
+    if branch and branch != "All":
+        q += " AND branch = ?"
+        params.append(branch)
+    q += " ORDER BY expense_date DESC, id DESC"
+    df = pd.read_sql_query(q, conn, params=params)
+    conn.close()
+    return df
+
+
+def delete_expense(exp_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM expenses WHERE id = ?", (exp_id,))
+        conn.commit()
+        return True, None
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+# ─── Staff ───
+def add_staff(full_name, role_title, branch, phone, monthly_salary, start_date, notes=""):
+    name = (full_name or "").strip()
+    if not name:
+        return False, "Name is required"
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO staff
+               (full_name, role_title, branch, phone, monthly_salary, start_date, is_active, notes)
+               VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+            (name, role_title, branch, phone, float(monthly_salary), start_date, notes),
+        )
+        conn.commit()
+        return True, None
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def update_staff(staff_id, full_name, role_title, branch, phone, monthly_salary, start_date, is_active, notes=""):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """UPDATE staff SET full_name=?, role_title=?, branch=?, phone=?,
+               monthly_salary=?, start_date=?, is_active=?, notes=? WHERE id=?""",
+            (full_name.strip(), role_title, branch, phone, float(monthly_salary),
+             start_date, 1 if is_active else 0, notes, staff_id),
+        )
+        conn.commit()
+        return True, None
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def get_staff_df(active_only=False):
+    conn = get_conn()
+    q = "SELECT * FROM staff"
+    if active_only:
+        q += " WHERE is_active = 1"
+    q += " ORDER BY full_name"
+    df = pd.read_sql_query(q, conn)
+    conn.close()
+    return df
+
+
+def add_salary_payment(staff_id, pay_date, amount, period_label="", notes=""):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT full_name FROM staff WHERE id = ?", (staff_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None, "Staff not found"
+    amt = float(amount)
+    if amt <= 0:
+        conn.close()
+        return None, "Amount must be greater than 0"
+    uid = f"SAL-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+    try:
+        cur.execute(
+            """INSERT INTO salary_payments
+               (unique_id, staff_id, staff_name, pay_date, period_label, amount, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (uid, staff_id, row["full_name"], pay_date, period_label, amt, notes),
+        )
+        conn.commit()
+        return uid, None
+    except Exception as e:
+        conn.rollback()
+        return None, str(e)
+    finally:
+        conn.close()
+
+
+def get_salary_payments_df(start_date=None, end_date=None):
+    conn = get_conn()
+    q = "SELECT * FROM salary_payments"
+    params = []
+    if start_date and end_date:
+        q += " WHERE pay_date BETWEEN ? AND ?"
+        params = [start_date, end_date]
+    q += " ORDER BY pay_date DESC, id DESC"
+    df = pd.read_sql_query(q, conn, params=params)
+    conn.close()
+    return df
+
+
+def get_branch_profit_summary(start_date=None, end_date=None):
+    """Revenue by branch, expenses by branch, approximate profit (revenue - expenses).
+    Note: COGS for finished goods is not fully deducted unless tracked separately.
+    """
+    sales = get_sales_df()
+    if start_date and end_date and not sales.empty:
+        sales = sales[(sales["sale_date"] >= start_date) & (sales["sale_date"] <= end_date)]
+    main_rev = float(sales["amount"].sum()) if not sales.empty else 0.0
+
+    conn = get_conn()
+    bq = "SELECT COALESCE(SUM(amount_sold), 0) AS t FROM branch_daily"
+    params = []
+    if start_date and end_date:
+        bq += " WHERE record_date BETWEEN ? AND ?"
+        params = [start_date, end_date]
+    punch_rev = float(pd.read_sql_query(bq, conn, params=params).iloc[0]["t"])
+
+    # special orders as main revenue if any amount
+    oq = "SELECT COALESCE(SUM(amount), 0) AS t FROM special_orders"
+    oparams = []
+    if start_date and end_date:
+        oq += " WHERE order_date BETWEEN ? AND ?"
+        oparams = [start_date, end_date]
+    orders_rev = float(pd.read_sql_query(oq, conn, params=oparams).iloc[0]["t"])
+    conn.close()
+
+    main_rev = main_rev + orders_rev
+
+    exp = get_expenses_df(start_date, end_date)
+    sal = get_salary_payments_df(start_date, end_date)
+    main_exp = float(exp[exp["branch"] == "Main"]["amount"].sum()) if not exp.empty else 0.0
+    punch_exp = float(exp[exp["branch"] == "Punch"]["amount"].sum()) if not exp.empty else 0.0
+    # shared/other expenses split or assigned to Main
+    other_exp = float(exp[~exp["branch"].isin(["Main", "Punch"])]["amount"].sum()) if not exp.empty else 0.0
+    main_exp += other_exp
+    salary_total = float(sal["amount"].sum()) if not sal.empty else 0.0
+    # salaries attributed to staff branch if possible — simple: all under Main for now unless we join
+    staff = get_staff_df()
+    # allocate salary payments proportionally is hard; attribute salary_total to Main by default
+    # Better: when paying salary we could store branch — for now add salary to total expenses only
+
+    return {
+        "main_revenue": main_rev,
+        "punch_revenue": punch_rev,
+        "main_expenses": main_exp,
+        "punch_expenses": punch_exp,
+        "salary_paid": salary_total,
+        "total_revenue": main_rev + punch_rev,
+        "total_expenses": main_exp + punch_exp + salary_total,
+        "main_profit": main_rev - main_exp,  # before shared salary allocation
+        "punch_profit": punch_rev - punch_exp,
+        "net_profit": main_rev + punch_rev - main_exp - punch_exp - salary_total,
+    }
+
+
 def to_excel_bytes(dfs: dict) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1492,6 +1739,8 @@ with st.sidebar:
             "Raw Materials",
             "Punch Branch",
             "Special Orders",
+            "Expenses",
+            "Staff & Salaries",
             "Daily Totals",
             "Products",
             "Export Excel",
@@ -1521,34 +1770,81 @@ if not is_admin and page not in ("Record Sale", "View Stock"):
 # DASHBOARD
 # ─────────────────────────────────────────────
 if page == "Dashboard":
-    st.header("Dashboard")
+    st.header("Company Dashboard")
+    st.caption("Revenue, expenses and profit by branch. Profit = revenue − recorded expenses − salaries paid (COGS for finished goods not fully deducted).")
+
+    # Period filter
+    p1, p2, p3 = st.columns([1, 1, 1])
+    with p1:
+        period = st.selectbox("Period", ["Today", "This month", "Last 30 days", "All time"], key="dash_period")
+    today = date.today()
+    if period == "Today":
+        d0 = d1 = today.isoformat()
+    elif period == "This month":
+        d0 = today.replace(day=1).isoformat()
+        d1 = today.isoformat()
+    elif period == "Last 30 days":
+        from datetime import timedelta
+        d0 = (today - timedelta(days=30)).isoformat()
+        d1 = today.isoformat()
+    else:
+        d0 = d1 = None
+
+    summary = get_branch_profit_summary(d0, d1)
     products = get_all_products()
     sales = get_sales_df()
-    daily = get_daily_totals()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Products", len(products))
-    c2.metric("Sales Records", len(sales))
-    today_str = date.today().isoformat()
-    today_sales = sales[sales["sale_date"] == today_str] if not sales.empty else pd.DataFrame()
-    c3.metric("Today's Revenue (₦)", f"{today_sales['amount'].sum():,.0f}" if not today_sales.empty else "0")
-    low_stock = products[products["current_stock"] <= 5]
+    staff = get_staff_df(active_only=True)
+    low_stock = products[products["current_stock"] <= 5] if not products.empty else pd.DataFrame()
     try:
         raws = get_raw_materials_df()
         low_raw = len(raws[raws["current_qty"] <= raws["reorder_level"]]) if not raws.empty else 0
+        inv_val = float((raws["current_qty"] * raws["unit_cost"]).sum()) if not raws.empty else 0.0
     except Exception:
-        low_raw = 0
-    c4.metric("Low product stock", len(low_stock))
-    # show ingredients needing reorder under metrics if any
+        low_raw, inv_val = 0, 0.0
 
+    st.subheader("Branch performance")
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        st.markdown("**Main branch**")
+        st.metric("Revenue", f"₦{summary['main_revenue']:,.0f}")
+        st.metric("Expenses", f"₦{summary['main_expenses']:,.0f}")
+        st.metric("Profit (approx.)", f"₦{summary['main_profit']:,.0f}")
+    with b2:
+        st.markdown("**Punch branch**")
+        st.metric("Revenue", f"₦{summary['punch_revenue']:,.0f}")
+        st.metric("Expenses", f"₦{summary['punch_expenses']:,.0f}")
+        st.metric("Profit (approx.)", f"₦{summary['punch_profit']:,.0f}")
+    with b3:
+        st.markdown("**Company total**")
+        st.metric("Total revenue", f"₦{summary['total_revenue']:,.0f}")
+        st.metric("Total expenses + salaries", f"₦{summary['total_expenses']:,.0f}")
+        st.metric("Net profit (approx.)", f"₦{summary['net_profit']:,.0f}")
+
+    st.caption(
+        f"Salaries paid in period: ₦{summary['salary_paid']:,.0f}. "
+        "Record daily costs under **Expenses** and salary payments under **Staff & Salaries**."
+    )
+
+    st.divider()
+    st.subheader("At a glance")
+    g1, g2, g3, g4, g5 = st.columns(5)
+    today_str = today.isoformat()
+    today_sales = sales[sales["sale_date"] == today_str] if not sales.empty else pd.DataFrame()
+    g1.metric("Today's sales (Main)", f"₦{today_sales['amount'].sum():,.0f}" if not today_sales.empty else "₦0")
+    g2.metric("Active staff", len(staff))
+    g3.metric("Monthly payroll (active)", f"₦{staff['monthly_salary'].sum():,.0f}" if not staff.empty else "₦0")
+    g4.metric("Low product stock", len(low_stock))
+    g5.metric("Raw materials value", f"₦{inv_val:,.0f}")
 
     if low_raw:
         st.warning(f"**{low_raw} raw material(s)** at or below reorder level — check **Raw Materials**.")
+    if not low_stock.empty:
+        st.warning(f"**{len(low_stock)} finished product(s)** low or out of stock — check **View Stock**.")
+
     st.divider()
     left, right = st.columns(2)
-
     with left:
-        st.subheader("Low / Out of Stock (finished products)")
+        st.subheader("Low / out of stock products")
         if low_stock.empty:
             st.success("All products are well stocked.")
         else:
@@ -1559,26 +1855,15 @@ if page == "Dashboard":
                 use_container_width=True,
                 hide_index=True,
             )
-
     with right:
-        st.subheader("Recent Daily Totals")
-        if daily.empty:
-            st.info("No sales recorded yet.")
+        st.subheader("Recent expenses")
+        exp = get_expenses_df(d0, d1)
+        if exp.empty:
+            st.info("No expenses in this period. Record them under **Expenses**.")
         else:
-            disp = daily.head(7).copy()
-            disp["total_amount"] = disp["total_amount"].apply(lambda x: f"₦{x:,.0f}")
-            st.dataframe(
-                disp.rename(
-                    columns={
-                        "date": "Date",
-                        "transactions": "Txns",
-                        "total_units": "Units",
-                        "total_amount": "Revenue",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
+            show = exp.head(10)[["expense_date", "category", "description", "amount", "branch"]].copy()
+            show.columns = ["Date", "Category", "Description", "Amount (₦)", "Branch"]
+            st.dataframe(show, use_container_width=True, hide_index=True)
 
 
 # ─────────────────────────────────────────────
@@ -2704,6 +2989,10 @@ elif page == "Export Excel":
                 "Unit Cost", "Total Cost", "Notes",
             ]
 
+        exp_df = get_expenses_df(exp_start.isoformat(), exp_end.isoformat())
+        sal_df = get_salary_payments_df(exp_start.isoformat(), exp_end.isoformat())
+        staff_df = get_staff_df()
+
         excel_bytes = to_excel_bytes({
             "Sales": sales_exp if not sales_exp.empty else pd.DataFrame({"Note": ["No sales in range"]}),
             "Stock Movements": moves_exp if not moves_exp.empty else pd.DataFrame({"Note": ["No movements in range"]}),
@@ -2713,6 +3002,9 @@ elif page == "Export Excel":
             "Punch Branch": branch_exp if not branch_exp.empty else pd.DataFrame({"Note": ["No branch records"]}),
             "Raw Materials": raw_exp if not raw_exp.empty else pd.DataFrame({"Note": ["No raw materials"]}),
             "Raw Material Movements": raw_moves_exp if not raw_moves_exp.empty else pd.DataFrame({"Note": ["No raw movements"]}),
+            "Expenses": exp_df if not exp_df.empty else pd.DataFrame({"Note": ["No expenses"]}),
+            "Salary Payments": sal_df if not sal_df.empty else pd.DataFrame({"Note": ["No salary payments"]}),
+            "Staff": staff_df if not staff_df.empty else pd.DataFrame({"Note": ["No staff"]}),
             "Products": prod_exp,
             "Daily Totals": daily_exp if not daily_exp.empty else pd.DataFrame({"Note": ["No daily totals"]}),
         })
@@ -2734,6 +3026,181 @@ elif page == "Export Excel":
 # ─────────────────────────────────────────────
 # SETTINGS
 # ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# EXPENSES
+# ─────────────────────────────────────────────
+elif page == "Expenses":
+    if not is_admin:
+        st.error("Admin only.")
+        st.stop()
+    st.header("Daily Expenses")
+    st.caption("Record every business cost: rent, fuel, packaging, utilities, transport, etc.")
+
+    EXP_CATS = [
+        "Rent", "Electricity", "Fuel / Generator", "Transport", "Packaging",
+        "Ingredients (cash purchase)", "Repairs", "Marketing", "Miscellaneous", "Other",
+    ]
+    tab1, tab2 = st.tabs(["Record Expense", "Expense History"])
+
+    with tab1:
+        with st.form("exp_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                ed = st.date_input("Date", value=date.today())
+                cat = st.selectbox("Category", EXP_CATS)
+                branch = st.selectbox("Branch", ["Main", "Punch", "Shared"])
+            with c2:
+                amt = st.number_input("Amount (₦)", min_value=0.0, step=100.0, value=0.0)
+                pay = st.selectbox("Payment method", ["Cash", "Transfer", "POS", "Other"])
+            desc = st.text_input("Description", placeholder="e.g. diesel for generator")
+            notes = st.text_input("Notes (optional)")
+            if st.form_submit_button("Save Expense", type="primary", use_container_width=True):
+                uid, err = add_expense(ed.isoformat(), cat, desc, amt, branch, pay, notes)
+                if err:
+                    st.error(err)
+                else:
+                    st.success(f"Expense saved · **{uid}**")
+                    st.rerun()
+
+    with tab2:
+        f1, f2 = st.columns(2)
+        with f1:
+            m = st.selectbox("Month filter", ["All", "This month"], key="exp_mf")
+        with f2:
+            br = st.selectbox("Branch filter", ["All", "Main", "Punch", "Shared"], key="exp_bf")
+        if m == "This month":
+            t = date.today()
+            s0, s1 = t.replace(day=1).isoformat(), t.isoformat()
+        else:
+            s0 = s1 = None
+        exp = get_expenses_df(s0, s1, br if br != "All" else None)
+        if exp.empty:
+            st.info("No expenses found.")
+        else:
+            st.metric("Total in view", f"₦{exp['amount'].sum():,.0f}")
+            show = exp[["id", "unique_id", "expense_date", "category", "description", "amount", "branch", "payment_method", "notes"]].copy()
+            show.columns = ["ID", "UID", "Date", "Category", "Description", "Amount", "Branch", "Method", "Notes"]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            del_id = st.number_input("Delete expense ID", min_value=0, step=1, value=0, key="del_exp")
+            if st.button("Delete expense") and del_id > 0:
+                ok, err = delete_expense(int(del_id))
+                if ok:
+                    st.success("Deleted.")
+                    st.rerun()
+                else:
+                    st.error(err)
+
+
+# ─────────────────────────────────────────────
+# STAFF & SALARIES
+# ─────────────────────────────────────────────
+elif page == "Staff & Salaries":
+    if not is_admin:
+        st.error("Admin only.")
+        st.stop()
+    st.header("Staff & Salaries")
+    st.caption("Keep a staff list with monthly salaries and record salary payments.")
+
+    tab1, tab2, tab3 = st.tabs(["Staff list", "Add / Edit staff", "Record salary payment"])
+
+    staff = get_staff_df()
+    with tab1:
+        if staff.empty:
+            st.info("No staff yet. Add people in the next tab.")
+        else:
+            active = staff[staff["is_active"] == 1]
+            st.metric("Active staff", len(active))
+            st.metric("Total monthly salaries (active)", f"₦{active['monthly_salary'].sum():,.0f}" if not active.empty else "₦0")
+            show = staff[["id", "full_name", "role_title", "branch", "phone", "monthly_salary", "start_date", "is_active"]].copy()
+            show["is_active"] = show["is_active"].map({1: "Active", 0: "Inactive"})
+            show.columns = ["ID", "Name", "Role", "Branch", "Phone", "Monthly salary (₦)", "Start date", "Status"]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+    with tab2:
+        st.subheader("Add staff")
+        with st.form("add_staff_form", clear_on_submit=True):
+            a1, a2 = st.columns(2)
+            with a1:
+                nm = st.text_input("Full name *")
+                role = st.text_input("Role / job title", placeholder="e.g. Baker, Sales rep")
+                br = st.selectbox("Branch", ["Main", "Punch"], key="st_br")
+            with a2:
+                phone = st.text_input("Phone")
+                sal = st.number_input("Monthly salary (₦)", min_value=0.0, step=1000.0, value=0.0)
+                sd = st.date_input("Start date", value=date.today())
+            notes = st.text_input("Notes", key="st_notes")
+            if st.form_submit_button("Add staff", type="primary"):
+                ok, err = add_staff(nm, role, br, phone, sal, sd.isoformat(), notes)
+                if ok:
+                    st.success(f"Added **{nm.strip()}**")
+                    st.rerun()
+                else:
+                    st.error(err)
+
+        st.divider()
+        st.subheader("Edit staff")
+        staff = get_staff_df()
+        if not staff.empty:
+            smap = {f"{r['full_name']} (ID {r['id']})": r["id"] for _, r in staff.iterrows()}
+            sel = st.selectbox("Select staff", list(smap.keys()), key="edit_staff_sel")
+            sid = smap[sel]
+            row = staff[staff["id"] == sid].iloc[0]
+            e1, e2 = st.columns(2)
+            with e1:
+                en = st.text_input("Name", value=row["full_name"], key="es_n")
+                er = st.text_input("Role", value=row["role_title"] or "", key="es_r")
+                eb = st.selectbox("Branch", ["Main", "Punch"], index=0 if row["branch"] == "Main" else 1, key="es_b")
+            with e2:
+                ep = st.text_input("Phone", value=row["phone"] or "", key="es_p")
+                esal = st.number_input("Monthly salary", min_value=0.0, value=float(row["monthly_salary"]), step=1000.0, key="es_s")
+                active = st.checkbox("Active", value=bool(row["is_active"]), key="es_a")
+            esd = st.text_input("Start date (YYYY-MM-DD)", value=row["start_date"] or "", key="es_d")
+            enotes = st.text_input("Notes", value=row["notes"] or "", key="es_no")
+            if st.button("Save staff changes", type="primary"):
+                ok, err = update_staff(sid, en, er, eb, ep, esal, esd, active, enotes)
+                if ok:
+                    st.success("Updated.")
+                    st.rerun()
+                else:
+                    st.error(err)
+
+    with tab3:
+        staff = get_staff_df(active_only=True)
+        if staff.empty:
+            st.warning("Add active staff first.")
+        else:
+            with st.form("sal_pay_form", clear_on_submit=True):
+                smap = {f"{r['full_name']} — ₦{r['monthly_salary']:,.0f}/mo": r["id"] for _, r in staff.iterrows()}
+                label = st.selectbox("Staff", list(smap.keys()))
+                sid = smap[label]
+                default_sal = float(staff[staff["id"] == sid].iloc[0]["monthly_salary"])
+                c1, c2 = st.columns(2)
+                with c1:
+                    pd_ = st.date_input("Payment date", value=date.today())
+                    period = st.text_input("Period", value=date.today().strftime("%B %Y"), placeholder="e.g. October 2026")
+                with c2:
+                    amt = st.number_input("Amount paid (₦)", min_value=0.0, step=1000.0, value=default_sal)
+                notes = st.text_input("Notes", key="sal_notes")
+                if st.form_submit_button("Record payment", type="primary", use_container_width=True):
+                    uid, err = add_salary_payment(sid, pd_.isoformat(), amt, period, notes)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.success(f"Salary payment saved · **{uid}**")
+                        st.rerun()
+
+            st.divider()
+            st.subheader("Recent salary payments")
+            pays = get_salary_payments_df()
+            if pays.empty:
+                st.caption("No payments recorded yet.")
+            else:
+                show = pays.head(20)[["unique_id", "pay_date", "staff_name", "period_label", "amount", "notes"]].copy()
+                show.columns = ["UID", "Date", "Staff", "Period", "Amount (₦)", "Notes"]
+                st.dataframe(show, use_container_width=True, hide_index=True)
+
+
 elif page == "Settings":
     if not is_admin:
         st.error("Only Admin can access Settings.")
