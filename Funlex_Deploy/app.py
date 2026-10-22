@@ -1055,7 +1055,7 @@ def delete_raw_material(material_id):
         conn.close()
 
 
-def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=None, notes=""):
+def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=None, total_amount=None, notes=""):
     """
     movement_type:
       purchase / received  -> increase
@@ -1063,6 +1063,9 @@ def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=
       waste_spoilage       -> decrease
       adjustment_in        -> increase
       adjustment_out       -> decrease
+
+    For purchases: pass total_amount (₦ paid) and quantity → unit_cost is calculated automatically.
+    Or pass unit_cost directly.
     """
     mat = get_raw_material_by_id(material_id)
     if not mat:
@@ -1078,8 +1081,35 @@ def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=
         after = before - qty
         if after < 0:
             return None, f"Not enough stock. Available: {before:.2f} {mat['unit']}"
-    cost = float(unit_cost) if unit_cost is not None and float(unit_cost) >= 0 else float(mat["unit_cost"])
-    total = qty * cost if movement_type in increase_types else 0.0
+
+    # Purchase cost for this batch (per unit)
+    old_cost = float(mat["unit_cost"] or 0)
+    if total_amount is not None and float(total_amount) > 0 and qty > 0:
+        batch_cost = float(total_amount) / qty
+        total = float(total_amount)
+    elif unit_cost is not None and float(unit_cost) >= 0:
+        batch_cost = float(unit_cost)
+        total = qty * batch_cost if movement_type in increase_types else 0.0
+    else:
+        batch_cost = old_cost
+        total = qty * batch_cost if movement_type in increase_types else 0.0
+
+    # Inventory valuation: Weighted Average Cost (WAC)
+    # New avg = (old_qty × old_cost + buy_qty × buy_cost) / (old_qty + buy_qty)
+    if movement_type in ("purchase", "received") and batch_cost > 0:
+        if before > 0 and old_cost > 0:
+            new_avg = (before * old_cost + qty * batch_cost) / (before + qty)
+        else:
+            new_avg = batch_cost
+        cost = batch_cost  # this movement records the batch purchase cost
+        avg_to_store = new_avg
+    else:
+        cost = batch_cost if batch_cost > 0 else old_cost
+        avg_to_store = old_cost
+        # Usage/waste valued at current average cost
+        if movement_type not in increase_types:
+            total = qty * old_cost
+
     uid = f"RAW-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
     conn = get_conn()
     cur = conn.cursor()
@@ -1088,11 +1118,10 @@ def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=
             "UPDATE raw_materials SET current_qty = ? WHERE id = ?",
             (after, material_id),
         )
-        # Update unit cost on purchase if provided
-        if movement_type in increase_types and unit_cost is not None and float(unit_cost) > 0:
+        if movement_type in ("purchase", "received") and avg_to_store > 0:
             cur.execute(
                 "UPDATE raw_materials SET unit_cost = ? WHERE id = ?",
-                (float(unit_cost), material_id),
+                (avg_to_store, material_id),
             )
         cur.execute(
             """INSERT INTO raw_material_movements
@@ -1387,27 +1416,17 @@ def show_logo(width=140):
 # LOGIN
 # ─────────────────────────────────────────────
 def login_page():
-    col1, col2, col3 = st.columns([1, 1.35, 1])
+    st.markdown("<br>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 1.2, 1])
     with col2:
-        st.markdown("<br><br>", unsafe_allow_html=True)
+        show_logo(160)
         st.markdown(
             """
-            <div style="background:#FFFFFF; border:1px solid #EEE8EF; border-radius:20px;
-                        padding:2rem 1.75rem 1.75rem; box-shadow:0 8px 32px rgba(28,28,40,0.08);
-                        text-align:center;">
-            """,
-            unsafe_allow_html=True,
-        )
-        logo_cols = st.columns([1, 2, 1])
-        with logo_cols[1]:
-            show_logo(160)
-        st.markdown(
-            """
-            <div style="margin-top:0.5rem; margin-bottom:1rem;">
-                <h1 style="color:#C2185B; font-size:1.55rem; font-weight:800; margin:0.35rem 0 0.2rem 0;
+            <div style="text-align:center; margin-top:0.4rem; margin-bottom:1.2rem;">
+                <h1 style="color:#C2185B; font-size:1.6rem; font-weight:800; margin:0.3rem 0 0.15rem 0;
                            letter-spacing:0.4px;">FUNLEX CAKES AND CREAM</h1>
-                <p style="color:#AD1457; font-size:0.88rem; font-style:italic; margin:0 0 0.35rem 0;
-                          letter-spacing:0.8px; font-weight:500;">The Taste Is The Difference</p>
+                <p style="color:#AD1457; font-size:0.9rem; font-style:italic; margin:0 0 0.3rem 0;
+                          letter-spacing:0.6px; font-weight:500;">The Taste Is The Difference</p>
                 <p style="color:#8A8A9A; font-size:0.8rem; margin:0; font-weight:500;">
                     Sales &amp; Stock Management
                 </p>
@@ -1424,7 +1443,6 @@ def login_page():
                 st.rerun()
             else:
                 st.error("Invalid access code. Please try again.")
-        st.markdown("</div>", unsafe_allow_html=True)
 
 
 if not st.session_state.authenticated:
@@ -1702,7 +1720,9 @@ elif page == "Raw Materials":
     st.header("Raw Materials Inventory")
     st.caption(
         "Track flour, butter, sugar and other ingredients. "
-        "Record purchases, production usage, and waste so you know what to reorder."
+        "Valuation method: **Weighted Average Cost (WAC)** — "
+        "unit cost updates automatically when you buy at a new price. "
+        "Stock value = quantity × average unit cost."
     )
 
     tab1, tab2, tab3 = st.tabs(["Stock Overview", "Record Movement", "Materials List"])
@@ -1719,7 +1739,8 @@ elif page == "Raw Materials":
             m1.metric("Materials", len(materials))
             m2.metric("Need reorder", len(low))
             total_val = (materials["current_qty"] * materials["unit_cost"]).sum()
-            m3.metric("Stock value (₦)", f"{total_val:,.0f}")
+            m3.metric("Inventory value (₦)", f"{total_val:,.0f}")
+            st.caption("Inventory value uses Weighted Average Cost × quantity on hand.")
 
             st.divider()
             st.subheader("Reorder soon")
@@ -1798,23 +1819,55 @@ elif page == "Raw Materials":
                     )
                     qty = st.number_input("Quantity", min_value=0.0, step=0.5, value=1.0)
                 mat = get_raw_material_by_id(material_id)
-                default_cost = float(mat["unit_cost"]) if mat else 0.0
-                cost = st.number_input(
-                    "Unit cost (₦) — for purchases",
-                    min_value=0.0,
-                    step=50.0,
-                    value=default_cost,
-                    help="Optional. Updates average reference cost on purchase.",
-                )
+                unit_label = mat["unit"] if mat else "unit"
+                # For purchases: enter total amount paid → unit cost calculated
+                total_paid = 0.0
+                cost = float(mat["unit_cost"]) if mat else 0.0
+                if mtype in ("purchase", "received"):
+                    st.markdown("**Purchase cost**")
+                    total_paid = st.number_input(
+                        "Total amount paid (₦) *",
+                        min_value=0.0,
+                        step=100.0,
+                        value=0.0,
+                        help="What you paid for this quantity in total.",
+                        key="raw_total_paid",
+                    )
+                    if qty > 0 and total_paid > 0:
+                        auto_unit = total_paid / qty
+                        st.success(
+                            f"**Unit cost (auto):** ₦{auto_unit:,.2f} per {unit_label}  "
+                            f"(₦{total_paid:,.0f} ÷ {qty:g})"
+                        )
+                    else:
+                        st.caption("Enter quantity and total amount paid to get unit cost automatically.")
                 notes = st.text_input("Notes", placeholder="e.g. from market, used for cake batch")
                 if st.form_submit_button("Save Movement", type="primary", use_container_width=True):
-                    uid, err = add_raw_movement(
-                        move_date.isoformat(), material_id, mtype, qty, cost, notes
-                    )
+                    if mtype in ("purchase", "received"):
+                        uid, err = add_raw_movement(
+                            move_date.isoformat(),
+                            material_id,
+                            mtype,
+                            qty,
+                            total_amount=total_paid if total_paid > 0 else None,
+                            notes=notes,
+                        )
+                    else:
+                        uid, err = add_raw_movement(
+                            move_date.isoformat(), material_id, mtype, qty, notes=notes
+                        )
                     if err:
                         st.error(err)
                     else:
-                        st.success(f"Saved  ·  **{uid}**")
+                        if mtype in ("purchase", "received") and qty > 0 and total_paid > 0:
+                            batch = total_paid / qty
+                            st.success(
+                                f"Saved  ·  **{uid}**  ·  "
+                                f"This purchase ₦{batch:,.2f}/{unit_label}  ·  "
+                                f"Average cost updated (weighted average)"
+                            )
+                        else:
+                            st.success(f"Saved  ·  **{uid}**")
                         st.rerun()
 
             st.divider()
