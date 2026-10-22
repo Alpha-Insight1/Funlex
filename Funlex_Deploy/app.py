@@ -400,7 +400,7 @@ def get_product_by_id(pid: int):
     return dict(row) if row else None
 
 
-def add_sale(sale_date, product_id, units_sold, notes="", unit_price=None):
+def add_sale(sale_date, product_id, units_sold, notes="", unit_price=None, payment_method="Cash"):
     """Record a sale. unit_price can override catalogue price for this sale only."""
     prod = get_product_by_id(product_id)
     if not prod:
@@ -436,12 +436,9 @@ def add_sale(sale_date, product_id, units_sold, notes="", unit_price=None):
     finally:
         conn.close()
 
-    # Phase 1 auto journal: Dr Cash, Cr Sales - Main
+    # Auto journal: Dr Cash/Bank, Cr Sales - Main
     try:
-        juid, jerr = auto_journal_sale(sale_date, amount, prod["name"], uid, payment="Cash")
-        if jerr:
-            # Sale is saved; journal failure should not block the sale
-            pass
+        auto_journal_sale(sale_date, amount, prod["name"], uid, payment=payment_method or "Cash")
     except Exception:
         pass
     return uid, None
@@ -814,12 +811,21 @@ def add_special_order(order_date, customer_name, product_description, quantity, 
              qty, price, amount, status, notes),
         )
         conn.commit()
-        return uid, None
     except Exception as e:
         conn.rollback()
         return None, str(e)
     finally:
         conn.close()
+    # Recognise revenue when order is completed/paid (not while still Pending)
+    st_ok = (status or "").strip().lower() in ("completed", "paid", "delivered", "done")
+    if amount > 0 and st_ok:
+        try:
+            auto_journal_special_order(
+                order_date, amount, customer_name, product_description, uid, payment="Cash"
+            )
+        except Exception:
+            pass
+    return uid, None
 
 
 def get_special_orders_df(start_date=None, end_date=None):
@@ -847,13 +853,26 @@ def update_special_order(order_id, customer_name, product_description, quantity,
                quantity=?, unit_price=?, amount=?, status=?, notes=? WHERE id=?""",
             (customer_name, product_description, qty, price, amount, status, notes, order_id),
         )
+        # fetch unique_id for journal
+        cur.execute("SELECT unique_id, order_date FROM special_orders WHERE id = ?", (order_id,))
+        row = cur.fetchone()
         conn.commit()
-        return True, None
     except Exception as e:
         conn.rollback()
         return False, str(e)
     finally:
         conn.close()
+    try:
+        st_ok = (status or "").strip().lower() in ("completed", "paid", "delivered", "done")
+        if row and amount > 0 and st_ok:
+            uid = row["unique_id"]
+            if not journal_exists_for_source("special_order", uid):
+                auto_journal_special_order(
+                    row["order_date"], amount, customer_name, product_description, uid, payment="Cash"
+                )
+    except Exception:
+        pass
+    return True, None
 
 
 def delete_special_order(order_id):
@@ -865,7 +884,7 @@ def delete_special_order(order_id):
 
 
 # ─── Punch Branch ───
-def add_branch_record(record_date, product_id, qty_taken, qty_sold, unit_price=None, notes=""):
+def add_branch_record(record_date, product_id, qty_taken, qty_sold, unit_price=None, notes="", payment_method="Cash"):
     """Record products produced for Punch branch, sold at Punch, and remaining.
     Does NOT touch main branch stock — goods are produced specially for Punch.
     unit_price: selling price at Punch (can differ from main catalogue price).
@@ -899,12 +918,18 @@ def add_branch_record(record_date, product_id, qty_taken, qty_sold, unit_price=N
             (uid, record_date, product_id, prod["name"], taken, sold, remaining, amount, price, notes),
         )
         conn.commit()
-        return uid, None
     except Exception as e:
         conn.rollback()
         return None, str(e)
     finally:
         conn.close()
+    # Auto journal Punch sales only when amount sold > 0
+    if amount > 0:
+        try:
+            auto_journal_punch_sale(record_date, amount, prod["name"], uid, payment=payment_method or "Cash")
+        except Exception:
+            pass
+    return uid, None
 
 
 def get_branch_df(start_date=None, end_date=None):
@@ -1239,12 +1264,16 @@ def add_raw_movement(move_date, material_id, movement_type, quantity, unit_cost=
     finally:
         conn.close()
 
-    # Phase 1 auto journal on purchase/received with amount
-    if movement_type in ("purchase", "received") and total and float(total) > 0:
-        try:
+    # Auto journals
+    try:
+        if movement_type in ("purchase", "received") and total and float(total) > 0:
             auto_journal_raw_purchase(move_date, float(total), mat["name"], uid, payment="Cash")
-        except Exception:
-            pass
+        elif movement_type in ("used_in_production", "waste_spoilage"):
+            usage_amt = qty * float(old_cost or 0)
+            if usage_amt > 0:
+                auto_journal_raw_usage(move_date, usage_amt, mat["name"], uid, movement_type)
+    except Exception:
+        pass
     return uid, None
 
 
@@ -1319,12 +1348,16 @@ def add_expense(expense_date, category, description, amount, branch="Main", paym
             (uid, expense_date, category, description, amt, branch, payment_method, notes),
         )
         conn.commit()
-        return uid, None
     except Exception as e:
         conn.rollback()
         return None, str(e)
     finally:
         conn.close()
+    try:
+        auto_journal_expense(expense_date, amt, category, description, uid, payment=payment_method)
+    except Exception:
+        pass
+    return uid, None
 
 
 def get_expenses_df(start_date=None, end_date=None, branch=None):
@@ -1410,7 +1443,7 @@ def get_staff_df(active_only=False):
     return df
 
 
-def add_salary_payment(staff_id, pay_date, amount, period_label="", notes=""):
+def add_salary_payment(staff_id, pay_date, amount, period_label="", notes="", payment_method="Cash"):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT full_name FROM staff WHERE id = ?", (staff_id,))
@@ -1431,12 +1464,16 @@ def add_salary_payment(staff_id, pay_date, amount, period_label="", notes=""):
             (uid, staff_id, row["full_name"], pay_date, period_label, amt, notes),
         )
         conn.commit()
-        return uid, None
     except Exception as e:
         conn.rollback()
         return None, str(e)
     finally:
         conn.close()
+    try:
+        auto_journal_salary(pay_date, amt, row["full_name"], uid, payment=payment_method)
+    except Exception:
+        pass
+    return uid, None
 
 
 def get_salary_payments_df(start_date=None, end_date=None):
@@ -1619,7 +1656,7 @@ def get_journal_lines_df(journal_id=None):
 
 def auto_journal_sale(sale_date, amount, product_name, sale_uid, payment="Cash"):
     """Dr Cash/Bank, Cr Sales - Main"""
-    cash_code = "1000" if payment == "Cash" else "1100"
+    cash_code = payment_account_code(payment)
     lines = [
         {"account_code": cash_code, "debit": amount, "credit": 0},
         {"account_code": "4000", "debit": 0, "credit": amount},
@@ -1637,7 +1674,7 @@ def auto_journal_raw_purchase(move_date, total_amount, material_name, move_uid, 
     """Dr Raw materials inventory, Cr Cash/Bank"""
     if total_amount <= 0:
         return None, "No amount to post"
-    cash_code = "1000" if payment == "Cash" else "1100"
+    cash_code = payment_account_code(payment)
     lines = [
         {"account_code": "1200", "debit": total_amount, "credit": 0},
         {"account_code": cash_code, "debit": 0, "credit": total_amount},
@@ -1647,6 +1684,115 @@ def auto_journal_raw_purchase(move_date, total_amount, material_name, move_uid, 
         f"Purchase: {material_name}",
         lines,
         source_type="raw_purchase",
+        source_id=move_uid,
+    )
+
+
+def payment_account_code(payment="Cash"):
+    """Map payment method to Cash (1000) or Bank/Transfer (1100)."""
+    p = (payment or "Cash").strip().lower()
+    if p in ("transfer", "bank", "pos", "card"):
+        return "1100"
+    return "1000"
+
+
+def journal_exists_for_source(source_type, source_id):
+    if not source_id:
+        return False
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM journal_entries WHERE source_type = ? AND source_id = ? LIMIT 1",
+        (source_type, source_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def auto_journal_expense(expense_date, amount, category, description, exp_uid, payment="Cash"):
+    """Dr Operating expenses, Cr Cash/Bank"""
+    if amount <= 0:
+        return None, "No amount"
+    cash_code = payment_account_code(payment)
+    narr = f"Expense: {category}" + (f" — {description}" if description else "")
+    lines = [
+        {"account_code": "5200", "debit": amount, "credit": 0},
+        {"account_code": cash_code, "debit": 0, "credit": amount},
+    ]
+    return post_journal(expense_date, narr, lines, source_type="expense", source_id=exp_uid)
+
+
+def auto_journal_salary(pay_date, amount, staff_name, sal_uid, payment="Cash"):
+    """Dr Salaries, Cr Cash/Bank"""
+    if amount <= 0:
+        return None, "No amount"
+    cash_code = payment_account_code(payment)
+    lines = [
+        {"account_code": "5300", "debit": amount, "credit": 0},
+        {"account_code": cash_code, "debit": 0, "credit": amount},
+    ]
+    return post_journal(
+        pay_date,
+        f"Salary: {staff_name}",
+        lines,
+        source_type="salary",
+        source_id=sal_uid,
+    )
+
+
+def auto_journal_punch_sale(record_date, amount, product_name, br_uid, payment="Cash"):
+    """Dr Cash/Bank, Cr Sales - Punch"""
+    if amount <= 0:
+        return None, "No amount"
+    cash_code = payment_account_code(payment)
+    lines = [
+        {"account_code": cash_code, "debit": amount, "credit": 0},
+        {"account_code": "4100", "debit": 0, "credit": amount},
+    ]
+    return post_journal(
+        record_date,
+        f"Punch sale: {product_name}",
+        lines,
+        source_type="punch_sale",
+        source_id=br_uid,
+    )
+
+
+def auto_journal_special_order(order_date, amount, customer, desc, ord_uid, payment="Cash"):
+    """Dr Cash/Bank, Cr Sales - Special orders"""
+    if amount <= 0:
+        return None, "No amount"
+    cash_code = payment_account_code(payment)
+    narr = f"Special order: {desc}" + (f" ({customer})" if customer else "")
+    lines = [
+        {"account_code": cash_code, "debit": amount, "credit": 0},
+        {"account_code": "4200", "debit": 0, "credit": amount},
+    ]
+    return post_journal(
+        order_date,
+        narr,
+        lines,
+        source_type="special_order",
+        source_id=ord_uid,
+    )
+
+
+def auto_journal_raw_usage(move_date, amount, material_name, move_uid, movement_type):
+    """Usage or waste: Dr COGS or Spoilage, Cr Raw materials inventory"""
+    if amount <= 0:
+        return None, "No amount"
+    expense_code = "5100" if movement_type == "waste_spoilage" else "5000"
+    label = "Waste/spoilage" if movement_type == "waste_spoilage" else "Materials used"
+    lines = [
+        {"account_code": expense_code, "debit": amount, "credit": 0},
+        {"account_code": "1200", "debit": 0, "credit": amount},
+    ]
+    return post_journal(
+        move_date,
+        f"{label}: {material_name}",
+        lines,
+        source_type="raw_usage",
         source_id=move_uid,
     )
 
@@ -2203,6 +2349,12 @@ elif page == "Record Sale":
                 help="Change this if the product is sold at a different price than the list price.",
                 key="sale_sell_price",
             )
+            pay_method = st.selectbox(
+                "Payment method",
+                ["Cash", "Transfer", "POS"],
+                key="sale_pay_method",
+                help="Cash → Cash account; Transfer/POS → Bank account in the books.",
+            )
 
             if prod:
                 amt = units * sell_price
@@ -2212,12 +2364,18 @@ elif page == "Record Sale":
                     f"**List price:** ₦{default_price:,.0f}  ·  "
                     f"**This sale price:** ₦{sell_price:,.0f}  ·  "
                     f"**Amount:** ₦{amt:,.0f}  ·  "
-                    f"**Stock after sale:** {close:.0f}"
+                    f"**Stock after sale:** {close:.0f}  ·  "
+                    f"**Pay:** {pay_method}"
                 )
 
             if st.form_submit_button("Save Sale", type="primary", use_container_width=True):
                 uid, err = add_sale(
-                    sale_date.isoformat(), product_id, units, notes, unit_price=sell_price
+                    sale_date.isoformat(),
+                    product_id,
+                    units,
+                    notes,
+                    unit_price=sell_price,
+                    payment_method=pay_method,
                 )
                 if err:
                     st.error(err)
@@ -2674,6 +2832,11 @@ elif page == "Punch Branch":
                     help="Punch can sell at a different price from the main branch catalogue.",
                 )
                 notes = st.text_input("Notes (optional)", key="br_notes")
+                pay_method = st.selectbox(
+                    "Payment method (for amount sold)",
+                    ["Cash", "Transfer", "POS"],
+                    key="br_pay",
+                )
                 remaining = max(0, qty_taken - qty_sold)
                 amt = qty_sold * punch_price
                 st.info(
@@ -2683,7 +2846,8 @@ elif page == "Punch Branch":
                 )
                 if st.form_submit_button("Save Branch Record", type="primary", use_container_width=True):
                     uid, err = add_branch_record(
-                        br_date.isoformat(), product_id, qty_taken, qty_sold, punch_price, notes
+                        br_date.isoformat(), product_id, qty_taken, qty_sold, punch_price, notes,
+                        payment_method=pay_method,
                     )
                     if err:
                         st.error(err)
@@ -3481,8 +3645,9 @@ elif page == "Staff & Salaries":
                 with c2:
                     amt = st.number_input("Amount paid (₦)", min_value=0.0, step=1000.0, value=default_sal)
                 notes = st.text_input("Notes", key="sal_notes")
+                pay_m = st.selectbox("Payment method", ["Cash", "Transfer"], key="sal_pay")
                 if st.form_submit_button("Record payment", type="primary", use_container_width=True):
-                    uid, err = add_salary_payment(sid, pd_.isoformat(), amt, period, notes)
+                    uid, err = add_salary_payment(sid, pd_.isoformat(), amt, period, notes, payment_method=pay_m)
                     if err:
                         st.error(err)
                     else:
