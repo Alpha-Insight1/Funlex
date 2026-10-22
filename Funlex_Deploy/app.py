@@ -1651,6 +1651,92 @@ def auto_journal_raw_purchase(move_date, total_amount, material_name, move_uid, 
     )
 
 
+def get_ledger_for_account(account_code, start_date=None, end_date=None):
+    """Return journal lines for one account with running balance.
+    Balance sign: Assets/Expenses increase with debit; Income increases with credit.
+    """
+    conn = get_conn()
+    q = """
+        SELECT je.entry_date, je.unique_id, je.description, je.source_type, je.source_id,
+               jl.account_code, jl.account_name, jl.debit, jl.credit
+        FROM journal_lines jl
+        JOIN journal_entries je ON je.id = jl.journal_id
+        WHERE jl.account_code = ?
+    """
+    params = [account_code]
+    if start_date and end_date:
+        q += " AND je.entry_date BETWEEN ? AND ?"
+        params.extend([start_date, end_date])
+    q += " ORDER BY je.entry_date ASC, je.id ASC, jl.id ASC"
+    df = pd.read_sql_query(q, conn, params=params)
+    acc = pd.read_sql_query(
+        "SELECT account_type FROM accounts WHERE code = ?", conn, params=[account_code]
+    )
+    conn.close()
+    if df.empty:
+        return df
+    atype = acc.iloc[0]["account_type"] if not acc.empty else "Asset"
+    # Normal debit balance: Asset, Expense
+    # Normal credit balance: Income (and Liability/Equity if added later)
+    normal_debit = atype in ("Asset", "Expense")
+    running = 0.0
+    balances = []
+    for _, r in df.iterrows():
+        dr = float(r["debit"] or 0)
+        cr = float(r["credit"] or 0)
+        if normal_debit:
+            running += dr - cr
+        else:
+            running += cr - dr
+        balances.append(running)
+    df = df.copy()
+    df["balance"] = balances
+    return df
+
+
+def get_trial_balance(start_date=None, end_date=None):
+    """Sum debits and credits per account for the period. Only accounts with activity."""
+    conn = get_conn()
+    q = """
+        SELECT jl.account_code, jl.account_name,
+               COALESCE(SUM(jl.debit), 0) AS total_debit,
+               COALESCE(SUM(jl.credit), 0) AS total_credit
+        FROM journal_lines jl
+        JOIN journal_entries je ON je.id = jl.journal_id
+    """
+    params = []
+    if start_date and end_date:
+        q += " WHERE je.entry_date BETWEEN ? AND ?"
+        params = [start_date, end_date]
+    q += " GROUP BY jl.account_code, jl.account_name ORDER BY jl.account_code"
+    df = pd.read_sql_query(q, conn, params=params)
+    # join type
+    acc = pd.read_sql_query("SELECT code, account_type FROM accounts", conn)
+    conn.close()
+    if df.empty:
+        return df
+    df = df.merge(acc, left_on="account_code", right_on="code", how="left")
+    df = df.drop(columns=["code"], errors="ignore")
+    # Closing balance column (debit-nature positive if more debits)
+    df["balance_debit"] = 0.0
+    df["balance_credit"] = 0.0
+    for i, r in df.iterrows():
+        net = float(r["total_debit"]) - float(r["total_credit"])
+        atype = r.get("account_type") or "Asset"
+        if atype in ("Asset", "Expense"):
+            if net >= 0:
+                df.at[i, "balance_debit"] = net
+            else:
+                df.at[i, "balance_credit"] = abs(net)
+        else:
+            # Income (credit normal)
+            if net <= 0:
+                df.at[i, "balance_credit"] = abs(net)
+            else:
+                df.at[i, "balance_debit"] = net
+    return df
+
+
 def to_excel_bytes(dfs: dict) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -3425,12 +3511,30 @@ elif page == "Accounts":
 
     st.header("Accounts")
     st.caption(
-        "Phase 1: Chart of accounts and auto journals. "
-        "Sales post **Dr Cash / Cr Sales – Main**. "
-        "Raw material purchases post **Dr Raw materials inventory / Cr Cash**."
+        "Sales → Dr Cash / Cr Sales – Main. "
+        "Raw material purchases → Dr Inventory / Cr Cash. "
+        "Ledger shows each account; trial balance checks that books balance."
     )
 
-    tab1, tab2 = st.tabs(["Chart of accounts", "Journals"])
+    # Shared period filter
+    today = date.today()
+    period = st.selectbox(
+        "Period",
+        ["This month", "Last 30 days", "All time"],
+        key="acc_period",
+    )
+    if period == "This month":
+        p0, p1 = today.replace(day=1).isoformat(), today.isoformat()
+    elif period == "Last 30 days":
+        from datetime import timedelta
+        p0 = (today - timedelta(days=30)).isoformat()
+        p1 = today.isoformat()
+    else:
+        p0 = p1 = None
+
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Chart of accounts", "Journals", "Ledger", "Trial balance"]
+    )
 
     with tab1:
         acc = get_accounts_df(active_only=False)
@@ -3441,48 +3545,25 @@ elif page == "Accounts":
             show["is_active"] = show["is_active"].map({1: "Active", 0: "Inactive"})
             show.columns = ["Code", "Account name", "Type", "Status"]
             st.dataframe(show, use_container_width=True, hide_index=True)
-            st.info(
-                "Default accounts are fixed for Phase 1. "
-                "Ledger and trial balance come in Phase 2."
-            )
 
     with tab2:
-        f1, f2 = st.columns(2)
-        with f1:
-            period = st.selectbox(
-                "Period",
-                ["This month", "Last 30 days", "All time"],
-                key="jrn_period",
-            )
-        today = date.today()
-        if period == "This month":
-            j0, j1 = today.replace(day=1).isoformat(), today.isoformat()
-        elif period == "Last 30 days":
-            from datetime import timedelta
-            j0 = (today - timedelta(days=30)).isoformat()
-            j1 = today.isoformat()
-        else:
-            j0 = j1 = None
-
-        journals = get_journals_df(j0, j1)
+        journals = get_journals_df(p0, p1)
         st.metric("Journal entries", len(journals))
         if journals.empty:
             st.info(
                 "No journals yet. Record a **sale** or a **raw material purchase** "
-                "(with total amount paid) to create the first entries."
+                "(with total amount paid) to create entries."
             )
         else:
             show = journals[["unique_id", "entry_date", "description", "source_type", "source_id"]].copy()
             show.columns = ["Journal ID", "Date", "Description", "Source", "Source ID"]
             st.dataframe(show, use_container_width=True, hide_index=True)
 
-            st.subheader("Journal lines")
+            st.subheader("All journal lines")
             lines = get_journal_lines_df()
-            if j0 and j1 and not lines.empty:
-                lines = lines[(lines["entry_date"] >= j0) & (lines["entry_date"] <= j1)]
-            if lines.empty:
-                st.caption("No lines.")
-            else:
+            if p0 and p1 and not lines.empty:
+                lines = lines[(lines["entry_date"] >= p0) & (lines["entry_date"] <= p1)]
+            if not lines.empty:
                 lshow = lines[
                     ["entry_date", "unique_id", "account_code", "account_name", "debit", "credit", "description"]
                 ].copy()
@@ -3493,10 +3574,91 @@ elif page == "Accounts":
                 c1, c2 = st.columns(2)
                 c1.metric("Total debits", f"₦{tot_dr:,.0f}")
                 c2.metric("Total credits", f"₦{tot_cr:,.0f}")
-                if abs(tot_dr - tot_cr) < 1:
-                    st.success("Debits equal credits for the listed lines.")
+
+    with tab3:
+        st.subheader("Account ledger")
+        st.caption(
+            "Pick one account to see every movement and the running balance. "
+            "Example: Cash shows −60,000 for flour and +1,000 for a sale."
+        )
+        accounts = get_accounts_df(active_only=True)
+        if accounts.empty:
+            st.warning("No accounts.")
+        else:
+            labels = {
+                f"{r['code']} — {r['name']} ({r['account_type']})": r["code"]
+                for _, r in accounts.iterrows()
+            }
+            sel = st.selectbox("Account", list(labels.keys()), key="ledger_acc")
+            code = labels[sel]
+            led = get_ledger_for_account(code, p0, p1)
+            if led.empty:
+                st.info("No movements on this account in the selected period.")
+            else:
+                show = led[
+                    ["entry_date", "unique_id", "description", "source_type", "debit", "credit", "balance"]
+                ].copy()
+                show.columns = [
+                    "Date", "Journal", "Description", "Source",
+                    "Debit (₦)", "Credit (₦)", "Balance (₦)",
+                ]
+                st.dataframe(show, use_container_width=True, hide_index=True)
+                last_bal = float(led["balance"].iloc[-1])
+                st.metric("Closing balance", f"₦{last_bal:,.2f}")
+                atype = accounts[accounts["code"] == code].iloc[0]["account_type"]
+                if atype in ("Asset", "Expense"):
+                    st.caption("Positive balance = debit balance (normal for assets/expenses).")
                 else:
-                    st.warning("Debits and credits do not match — check entries.")
+                    st.caption("Positive balance = credit balance (normal for income).")
+
+    with tab4:
+        st.subheader("Trial balance")
+        st.caption(
+            "Totals per account for the period. "
+            "Total debit column should equal total credit column."
+        )
+        tb = get_trial_balance(p0, p1)
+        if tb.empty:
+            st.info("No journal activity in this period.")
+        else:
+            show = tb[
+                ["account_code", "account_name", "account_type",
+                 "total_debit", "total_credit", "balance_debit", "balance_credit"]
+            ].copy()
+            show.columns = [
+                "Code", "Account", "Type",
+                "Period debit (₦)", "Period credit (₦)",
+                "Balance Dr (₦)", "Balance Cr (₦)",
+            ]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            sum_dr = float(tb["total_debit"].sum())
+            sum_cr = float(tb["total_credit"].sum())
+            bal_dr = float(tb["balance_debit"].sum())
+            bal_cr = float(tb["balance_credit"].sum())
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Sum of debits", f"₦{sum_dr:,.0f}")
+            m2.metric("Sum of credits", f"₦{sum_cr:,.0f}")
+            m3.metric("Balance column Dr", f"₦{bal_dr:,.0f}")
+            m4.metric("Balance column Cr", f"₦{bal_cr:,.0f}")
+            if abs(sum_dr - sum_cr) < 1:
+                st.success("Trial balance is in balance (period debits = period credits).")
+            else:
+                st.error("Trial balance is out of balance — check journal entries.")
+            # Simple income vs expense snapshot
+            income = tb[tb["account_type"] == "Income"]
+            expense = tb[tb["account_type"] == "Expense"]
+            inc_amt = float(income["total_credit"].sum() - income["total_debit"].sum()) if not income.empty else 0.0
+            exp_amt = float(expense["total_debit"].sum() - expense["total_credit"].sum()) if not expense.empty else 0.0
+            st.divider()
+            st.markdown("**From trial balance (this period)**")
+            i1, i2, i3 = st.columns(3)
+            i1.metric("Income (sales etc.)", f"₦{inc_amt:,.0f}")
+            i2.metric("Expenses (posted)", f"₦{exp_amt:,.0f}")
+            i3.metric("Income − expenses", f"₦{inc_amt - exp_amt:,.0f}")
+            st.caption(
+                "Only accounts that received auto-journals appear. "
+                "Expenses and salaries will show here once those are auto-posted (future phase)."
+            )
 
 
 elif page == "Settings":
